@@ -57,7 +57,7 @@ import {
   Sun,
 } from "lucide-react";
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
+import { getAuth, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, inMemoryPersistence, signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import {
   getFirestore,
   doc,
@@ -711,7 +711,13 @@ const _fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
 let _fbAuth: any = null;
 let _fbDb: any = null;
 function getFirebaseServices() {
-  if (!_fbAuth) _fbAuth = getAuth(_fbApp);
+  if (!_fbAuth) {
+    try {
+      _fbAuth = initializeAuth(_fbApp, { persistence: [indexedDBLocalPersistence, browserLocalPersistence, inMemoryPersistence] });
+    } catch (e) {
+      _fbAuth = getAuth(_fbApp);
+    }
+  }
   if (!_fbDb) _fbDb = getFirestore(_fbApp);
   return { app: _fbApp, auth: _fbAuth, db: _fbDb };
 }
