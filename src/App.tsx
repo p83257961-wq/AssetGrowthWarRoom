@@ -76,15 +76,6 @@ const firebaseConfig = {
   messagingSenderId: "344662439136",
   appId: "1:344662439136:web:463fab492d7804f366cc85",
 };
-
-// Eagerly initialize Firebase at module top-level to ensure components (auth, firestore) are registered before React effects run.
-const __FIREBASE_APP__ = (() => {
-  try { return getApps().length ? getApp() : initializeApp(firebaseConfig); } catch (e) { return null; }
-})();
-const __FIREBASE_AUTH__ = (() => { try { return __FIREBASE_APP__ ? getAuth(__FIREBASE_APP__) : null; } catch (e) { return null; } })();
-const __FIREBASE_DB__ = (() => { try { return __FIREBASE_APP__ ? getFirestore(__FIREBASE_APP__) : null; } catch (e) { return null; } })();
-
-
 /* ─── THEMES ─── */
 const THEMES = {
   dark: {
@@ -716,8 +707,9 @@ function downloadCSV(r) {
   URL.revokeObjectURL(u);
 }
 function getFirebaseServices() {
-  const app = __FIREBASE_APP__ || (getApps().length ? getApp() : initializeApp(firebaseConfig));
-  return { app, auth: __FIREBASE_AUTH__ || getAuth(app), db: __FIREBASE_DB__ || getFirestore(app) };
+  let app;
+  try { app = getApp(); } catch (e) { app = initializeApp(firebaseConfig); }
+  return { app, auth: getAuth(app), db: getFirestore(app) };
 }
 function projectScenarios(
   pd,
@@ -836,10 +828,12 @@ export default function App() {
 
   // Firebase
   useEffect(() => {
-    let ua = null,
-      ud = null,
+    let ua: any = null,
+      ud: any = null,
       mt = true;
-    try {
+    const initTimer = setTimeout(() => {
+      if (!mt) return;
+      try {
       const { auth, db } = getFirebaseServices();
       const cdr = doc(db, CLOUD_DOC_PATH[0], CLOUD_DOC_PATH[1]);
       ua = onAuthStateChanged(auth, async (user) => {
@@ -903,8 +897,10 @@ export default function App() {
       const msg = (e && (e.code || e.message)) ? String(e.code || e.message).substring(0, 60) : "unknown";
       setCloudState("初始化失敗:" + msg);
     }
+    }, 250);
     return () => {
       mt = false;
+      clearTimeout(initTimer);
       if (ua) ua();
       if (ud) ud();
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
