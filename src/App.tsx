@@ -706,11 +706,13 @@ function downloadCSV(r) {
   document.body.removeChild(a);
   URL.revokeObjectURL(u);
 }
-// Firebase 在 module 載入時即時初始化，避免 production build 的時序問題
+// Firebase app 在 module 載入時建立（安全），auth/db 延遲到首次使用以避免 component 註冊競爭
 const _fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-const _fbAuth = getAuth(_fbApp);
-const _fbDb = getFirestore(_fbApp);
+let _fbAuth: any = null;
+let _fbDb: any = null;
 function getFirebaseServices() {
+  if (!_fbAuth) _fbAuth = getAuth(_fbApp);
+  if (!_fbDb) _fbDb = getFirestore(_fbApp);
   return { app: _fbApp, auth: _fbAuth, db: _fbDb };
 }
 function projectScenarios(
