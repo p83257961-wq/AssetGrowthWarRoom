@@ -706,10 +706,12 @@ function downloadCSV(r) {
   document.body.removeChild(a);
   URL.revokeObjectURL(u);
 }
+// Firebase 在 module 載入時即時初始化，避免 production build 的時序問題
+const _fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+const _fbAuth = getAuth(_fbApp);
+const _fbDb = getFirestore(_fbApp);
 function getFirebaseServices() {
-  let app;
-  try { app = getApp(); } catch (e) { app = initializeApp(firebaseConfig); }
-  return { app, auth: getAuth(app), db: getFirestore(app) };
+  return { app: _fbApp, auth: _fbAuth, db: _fbDb };
 }
 function projectScenarios(
   pd,
@@ -831,9 +833,8 @@ export default function App() {
     let ua: any = null,
       ud: any = null,
       mt = true;
-    const initTimer = setTimeout(() => {
+    try {
       if (!mt) return;
-      try {
       const { auth, db } = getFirebaseServices();
       const cdr = doc(db, CLOUD_DOC_PATH[0], CLOUD_DOC_PATH[1]);
       ua = onAuthStateChanged(auth, async (user) => {
@@ -897,10 +898,8 @@ export default function App() {
       const msg = (e && (e.code || e.message)) ? String(e.code || e.message).substring(0, 60) : "unknown";
       setCloudState("初始化失敗:" + msg);
     }
-    }, 250);
     return () => {
       mt = false;
-      clearTimeout(initTimer);
       if (ua) ua();
       if (ud) ud();
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
