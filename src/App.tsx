@@ -708,7 +708,8 @@ function downloadCSV(r) {
   URL.revokeObjectURL(u);
 }
 function getFirebaseServices() {
-  const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+  let app;
+  try { app = getApp(); } catch (e) { app = initializeApp(firebaseConfig); }
   return { app, auth: getAuth(app), db: getFirestore(app) };
 }
 function projectScenarios(
@@ -815,8 +816,9 @@ export default function App() {
     try {
       persistLocal(records);
       setSaveStatus(`已儲存 ${new Date().toLocaleTimeString("zh-TW")}`);
-    } catch {
-      setSaveStatus("失敗");
+    } catch (e) {
+      console.error("[Save] error:", e);
+      setSaveStatus("失敗:" + (e?.code || e?.message || ""));
     }
   }, [records]);
   useEffect(() => {
@@ -878,17 +880,21 @@ export default function App() {
                 remoteJsonRef.current = "";
               }
             },
-            () => {
+            (err) => {
+              console.error("[CloudSync] snapshot error:", err);
               setCloudReady(false);
-              setCloudState("監聽失敗");
+              setCloudState("監聽失敗:" + (err?.code || err?.message || ""));
             }
           );
-        } catch {
-          setCloudState("連線失敗");
+        } catch (e) {
+          console.error("[CloudSync] connection error:", e);
+          setCloudState("連線失敗:" + (e?.code || e?.message || ""));
         }
       });
-    } catch {
-      setCloudState("初始化失敗");
+    } catch (e) {
+      console.error("[CloudSync] init error:", e);
+      const msg = (e && (e.code || e.message)) ? String(e.code || e.message).substring(0, 60) : "unknown";
+      setCloudState("初始化失敗:" + msg);
     }
     return () => {
       mt = false;
