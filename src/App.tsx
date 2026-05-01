@@ -143,7 +143,7 @@ const THEMES = {
 /* 當前主題（module-level，由 App 在 render 前更新） */
 let T = THEMES.dark;
 /* ─── Animated Number ─── */
-function useAnimNum(target, dur = 600) {
+function useAnimNum(target: number, dur: number = 600) {
   const [d, setD] = useState(target);
   const prev = useRef(target);
   const fr = useRef(null);
