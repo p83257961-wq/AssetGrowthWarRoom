@@ -1,10 +1,4 @@
-import React, {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useCallback,
-} from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -31,10 +25,10 @@ import {
   TrendingUp,
   TrendingDown,
   Download,
+  Upload,
   X,
   BarChart3,
   Activity,
-  ArrowUpRight,
   Banknote,
   CalendarDays,
   Cloud,
@@ -709,6 +703,73 @@ function downloadCSV(r) {
   document.body.removeChild(a);
   URL.revokeObjectURL(u);
 }
+/* hex 轉 rgba（熱力圖依報酬強度調透明度用） */
+function hexA(hex, a) {
+  const h = String(hex).replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16),
+    g = parseInt(h.slice(2, 4), 16),
+    b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+/* 解析匯出的 CSV（同 toCSV 格式，支援引號跳脫），回傳排序後紀錄或 null */
+function parseCSVRecords(text) {
+  const clean = String(text || "").replace(/^\uFEFF/, "");
+  const lines = clean.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) return null;
+  const parseLine = (line) => {
+    const out = [];
+    let cur = "",
+      inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (line[i + 1] === '"') {
+            cur += '"';
+            i++;
+          } else inQ = false;
+        } else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === ",") {
+        out.push(cur);
+        cur = "";
+      } else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  };
+  const header = parseLine(lines[0]).map((h) => h.trim());
+  const idx = {};
+  [
+    "month",
+    "totalAssets",
+    "cashAssets",
+    "otherAssets",
+    "netIn",
+    "netOut",
+    "note",
+  ].forEach((k) => {
+    idx[k] = header.indexOf(k);
+  });
+  if (idx.month === -1 || idx.totalAssets === -1) return null;
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const c = parseLine(lines[i]);
+    const month = String(c[idx.month] || "").trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) continue;
+    rows.push({
+      month,
+      totalAssets: Number(c[idx.totalAssets] || 0),
+      cashAssets: idx.cashAssets >= 0 ? c[idx.cashAssets] : "",
+      otherAssets: idx.otherAssets >= 0 ? c[idx.otherAssets] : "",
+      netIn: idx.netIn >= 0 ? Number(c[idx.netIn] || 0) : 0,
+      netOut: idx.netOut >= 0 ? Number(c[idx.netOut] || 0) : 0,
+      note: idx.note >= 0 ? String(c[idx.note] || "") : "",
+    });
+  }
+  rows.sort((a, b) => a.month.localeCompare(b.month));
+  return rows.length ? rows : null;
+}
 // Firebase app 在 module 載入時建立（安全），auth/db 延遲到首次使用以避免 component 註冊競爭
 const _fbApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
 let _fbAuth = null;
@@ -852,8 +913,13 @@ export default function App() {
   const [sortDir, setSortDir] = useState("desc");
   const [scenarioRate, setScenarioRate] = useState(null);
   const [scenarioInflow, setScenarioInflow] = useState(null);
-  const [tabKey, setTabKey] = useState(0);
-  const [prevTab, setPrevTab] = useState(null);
+  const [animTab, setAnimTab] = useState("overview");
+  const visitedTabsRef = useRef({ overview: true });
+  const [showDataModal, setShowDataModal] = useState(false);
+  const csvInputRef = useRef(null);
+  const jsonInputRef = useRef(null);
+  const [fireInput, setFireInput] = useState("");
+  const [fireExpense, setFireExpense] = useState(0);
   const [hoveredMonth, setHoveredMonth] = useState(null);
   const [isDark, setIsDark] = useState(() => {
     try {
@@ -888,12 +954,21 @@ export default function App() {
   T = isDark ? THEMES.dark : THEMES.light;
   const css = useMemo(() => makeCSS(T), [isDark]);
   const mask = (s) => (privacy ? "＊＊＊＊＊" : s);
+  useEffect(() => {
+    if (!showDataModal) return;
+    const h = (e) => {
+      if (e.key === "Escape") setShowDataModal(false);
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [showDataModal]);
   const remoteAppliedRef = useRef(false);
   const saveTimerRef = useRef(null);
   const remoteJsonRef = useRef(
     JSON.stringify(normalizeRecords(loaded.records))
   );
   const remoteGoalRef = useRef(0);
+  const remoteFireRef = useRef(0);
   const [formData, setFormData] = useState({
     month: getCurrentMonth(),
     totalAssets: "",
@@ -956,6 +1031,12 @@ export default function App() {
                   setGoalValue(Number(rg));
                   remoteGoalRef.current = Number(rg);
                 }
+                const rf = snap.data()?.fireExpense;
+                if (rf) {
+                  setFireInput(String(rf));
+                  setFireExpense(Number(rf));
+                  remoteFireRef.current = Number(rf);
+                }
                 setRecords((cur) => {
                   if (JSON.stringify(normalizeRecords(cur)) === rj) return cur;
                   persistLocal(recs);
@@ -1000,8 +1081,14 @@ export default function App() {
     if (!authReady || !cloudReady || !remoteAppliedRef.current) return;
     const cn = normalizeRecords(records),
       cj = JSON.stringify(cn),
-      cg = goalValue || 0;
-    if (cj === remoteJsonRef.current && cg === remoteGoalRef.current) return;
+      cg = goalValue || 0,
+      cf = fireExpense || 0;
+    if (
+      cj === remoteJsonRef.current &&
+      cg === remoteGoalRef.current &&
+      cf === remoteFireRef.current
+    )
+      return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
       try {
@@ -1011,6 +1098,7 @@ export default function App() {
           {
             records: cn,
             goalValue: cg,
+            fireExpense: cf,
             updatedAt: serverTimestamp(),
             updatedAtClient: Date.now(),
             updatedBy: cloudUid || "anon",
@@ -1021,6 +1109,7 @@ export default function App() {
         );
         remoteJsonRef.current = cj;
         remoteGoalRef.current = cg;
+        remoteFireRef.current = cf;
         setCloudState("已同步");
         setSaveStatus(`已同步 ${new Date().toLocaleTimeString("zh-TW")}`);
       } catch {
@@ -1030,7 +1119,7 @@ export default function App() {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [records, goalValue, authReady, cloudReady, cloudUid]);
+  }, [records, goalValue, fireExpense, authReady, cloudReady, cloudUid]);
 
   const pd = useMemo(() => calcProcessed(records), [records]);
   const annualSummary = useMemo(() => getAnnualSummary(pd), [pd]);
@@ -1044,12 +1133,19 @@ export default function App() {
       [...new Set(records.map((r) => getYear(r.month)))].sort((a, b) => b - a),
     [records]
   );
-  // isDark 必須在 deps 裡：桶色是從當前主題 T 取的，否則切主題後顏色停在舊主題
-  const retDist = useMemo(() => getReturnDist(pd), [pd, isDark]);
-  const winRate = useMemo(() => {
-    const t = pd.length;
-    return t ? (pd.filter((r) => r.returnRate > 0).length / t) * 100 : 0;
+  // 全域統計與情境模擬同口徑：排除「總資產與上月相同」的未更新月份
+  const basisPd = useMemo(() => {
+    const real = pd.filter(
+      (r) => Number(r.totalAssets) !== Number(r.prevAssets)
+    );
+    return real.length >= 4 ? real : pd;
   }, [pd]);
+  // isDark 必須在 deps 裡：桶色是從當前主題 T 取的，否則切主題後顏色停在舊主題
+  const retDist = useMemo(() => getReturnDist(basisPd), [basisPd, isDark]);
+  const winRate = useMemo(() => {
+    const t = basisPd.length;
+    return t ? (basisPd.filter((r) => r.returnRate > 0).length / t) * 100 : 0;
+  }, [basisPd]);
   const scenarios = useMemo(
     () =>
       latest
@@ -1090,6 +1186,75 @@ export default function App() {
     });
     return m;
   }, [scenarios, goalValue]);
+  // 成長貢獻分解：總資產 = 起始資產 + 累計投入 + 累計報酬
+  const contribData = useMemo(() => {
+    if (pd.length < 2) return null;
+    const base = pd[0].totalAssets;
+    let cin = 0;
+    const rows = pd.map((r, i) => {
+      if (i > 0) cin += Number(r.netCashFlow || 0);
+      return {
+        month: r.month,
+        base,
+        cumInflow: Math.round(cin),
+        total: r.totalAssets,
+        cumGain: Math.round(r.totalAssets - base - cin),
+      };
+    });
+    const last = rows[rows.length - 1];
+    return {
+      base,
+      rows,
+      totalInflow: last.cumInflow,
+      totalGain: last.cumGain,
+      growth: last.total - base,
+    };
+  }, [pd]);
+  const heatmapYears = useMemo(() => {
+    const map = {};
+    pd.forEach((r) => {
+      const y = getYear(r.month);
+      const m = Number(r.month.slice(5, 7));
+      if (!map[y]) map[y] = {};
+      map[y][m] = r;
+    });
+    return Object.keys(map)
+      .sort((a, b) => Number(b) - Number(a))
+      .map((year) => ({ year, months: map[year] }));
+  }, [pd]);
+  // 年化報酬（TWR）：報酬鏈用有效月份，年化期間用實際經過月數
+  const twrStats = useMemo(() => {
+    const chain = basisPd.reduce(
+      (f, r) => f * (1 + Number(r.returnRate || 0) / 100),
+      1
+    );
+    const cum = (chain - 1) * 100;
+    const n = Math.max(1, pd.length - 1);
+    const ann = chain > 0 ? (Math.pow(chain, 12 / n) - 1) * 100 : 0;
+    return { cum, ann };
+  }, [basisPd, pd]);
+  // FIRE：自由數字 = 年支出 × 25（4% 法則），沿用滑桿假設推 20 年
+  const fireStats = useMemo(() => {
+    if (!fireExpense || fireExpense <= 0 || !latest) return null;
+    const fireNumber = fireExpense * 25;
+    const sc = projectScenarios(
+      pd,
+      latest.totalAssets,
+      240,
+      scenarioRate,
+      scenarioInflow
+    );
+    const reach = sc.map((s) => ({
+      key: s.key,
+      label: s.label,
+      idx: s.points.findIndex((p) => p.value >= fireNumber),
+    }));
+    return {
+      fireNumber,
+      reach,
+      progress: Math.min(100, (latest.totalAssets / fireNumber) * 100),
+    };
+  }, [fireExpense, latest, pd, scenarioRate, scenarioInflow]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
     const cur = latest.totalAssets,
@@ -1142,30 +1307,31 @@ export default function App() {
     const md = Math.min(...pd.map((r) => r.drawdown), 0),
       ath = Math.max(...pd.map((r) => r.totalAssets), 0);
     const athD = ath > 0 ? ((latest.totalAssets - ath) / ath) * 100 : 0;
+    // 連勝／均報酬／波動度用有效月份（basisPd），避免未更新月份的假負報酬污染
     let ws = 0;
-    for (let i = pd.length - 1; i >= 0; i--) {
-      if (pd[i].returnRate > 0) ws++;
+    for (let i = basisPd.length - 1; i >= 0; i--) {
+      if (basisPd[i].returnRate > 0) ws++;
       else break;
     }
     let lws = 0;
     if (ws === 0) {
       let c = false;
-      for (let i = pd.length - 2; i >= 0; i--) {
-        if (!c && pd[i].returnRate <= 0) {
+      for (let i = basisPd.length - 2; i >= 0; i--) {
+        if (!c && basisPd[i].returnRate <= 0) {
           c = true;
           continue;
         }
-        if (c && pd[i].returnRate > 0) lws++;
+        if (c && basisPd[i].returnRate > 0) lws++;
         else if (c) break;
       }
     }
-    const l6 = pd.slice(-6),
+    const l6 = basisPd.slice(-6),
       a6 = l6.reduce((a, c) => a + c.returnRate, 0) / (l6.length || 1);
     const cr =
       latest.totalAssets > 0
         ? (latest.cashAssets / latest.totalAssets) * 100
         : 0;
-    const rets = pd.map((r) => r.returnRate),
+    const rets = basisPd.map((r) => r.returnRate),
       ar = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
     const vol = Math.sqrt(
       rets.reduce((s, r) => s + (r - ar) ** 2, 0) / (rets.length || 1)
@@ -1190,7 +1356,7 @@ export default function App() {
       totalMonths: pd.length,
       volatility: vol,
     };
-  }, [latest, pd]);
+  }, [latest, pd, basisPd]);
 
   const formErrors = useMemo(() => {
     const e = [];
@@ -1329,6 +1495,7 @@ export default function App() {
         {
           records: n,
           goalValue: goalValue || 0,
+          fireExpense: fireExpense || 0,
           updatedAt: serverTimestamp(),
           updatedAtClient: Date.now(),
           updatedBy: cloudUid || "anon",
@@ -1339,6 +1506,7 @@ export default function App() {
       );
       remoteJsonRef.current = JSON.stringify(n);
       remoteGoalRef.current = goalValue || 0;
+      remoteFireRef.current = fireExpense || 0;
       setCloudReady(true);
       remoteAppliedRef.current = true;
       setCloudState("已同步");
@@ -1371,6 +1539,97 @@ export default function App() {
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
     setToast("已復原");
   };
+  // ── 匯入／備份／還原 ──
+  const handleImportCSV = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rows = parseCSVRecords(String(reader.result || ""));
+      if (!rows) {
+        setToast("CSV 格式無法解析");
+        return;
+      }
+      const dup = rows.filter((r) =>
+        records.some((x) => x.month === r.month)
+      ).length;
+      setShowDataModal(false);
+      setConfirmDlg({
+        title: "匯入 CSV",
+        message: `將匯入 ${rows.length} 筆（${rows[0].month} ~ ${
+          rows[rows.length - 1].month
+        }），其中 ${dup} 筆與現有月份重複、將被覆蓋。`,
+        onConfirm: () => {
+          setRecords((p) => {
+            const m = new Map(p.map((r) => [r.month, r]));
+            rows.forEach((r) => m.set(r.month, r));
+            return normalizeRecords([...m.values()]);
+          });
+          setToast(`已匯入 ${rows.length} 筆`);
+        },
+      });
+    };
+    reader.readAsText(file, "utf-8");
+  };
+  const downloadBackup = () => {
+    const payload = {
+      app: "asset-growth-war-room",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      goalValue: goalValue || 0,
+      fireExpense: fireExpense || 0,
+      records: normalizeRecords(records),
+    };
+    const b = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = u;
+    a.download = `asset-growth-backup-${new Date()
+      .toISOString()
+      .slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(u);
+    setToast("備份已下載");
+  };
+  const handleRestoreJSON = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const p = JSON.parse(String(reader.result || ""));
+        const recs = Array.isArray(p.records)
+          ? normalizeRecords(p.records)
+          : null;
+        if (!recs || !recs.length) {
+          setToast("備份檔無有效資料");
+          return;
+        }
+        setShowDataModal(false);
+        setConfirmDlg({
+          title: "還原備份",
+          message: `備份含 ${recs.length} 筆（${recs[0].month} ~ ${
+            recs[recs.length - 1].month
+          }），將完全取代現有 ${records.length} 筆資料。`,
+          onConfirm: () => {
+            setRecords(recs);
+            if (p.goalValue) {
+              setGoalValue(Number(p.goalValue));
+              setGoalInput(String(p.goalValue));
+            }
+            if (p.fireExpense) {
+              setFireInput(String(p.fireExpense));
+              setFireExpense(Number(p.fireExpense));
+            }
+            setToast("已還原備份");
+          },
+        });
+      } catch {
+        setToast("備份檔無法解析");
+      }
+    };
+    reader.readAsText(file, "utf-8");
+  };
   const handleEdit = (row) => {
     setEditingMonth(row.month);
     setFormData({
@@ -1389,12 +1648,15 @@ export default function App() {
     setEditingMonth("");
     setHasSubmitted(false);
     const m = getCurrentMonth();
+    // 預設帶上月的現金／其它／淨投入，每月記帳只需改總資產
     setFormData({
       month: m,
       totalAssets: "",
-      cashAssets: String(defaultCashByMonth(m)),
-      otherAssets: "0",
-      netIn: "0",
+      cashAssets: latest
+        ? String(latest.cashAssets)
+        : String(defaultCashByMonth(m)),
+      otherAssets: latest ? String(latest.otherAssets) : "0",
+      netIn: latest ? String(latest.netIn) : "0",
       netOut: "0",
       note: "",
     });
@@ -1406,10 +1668,15 @@ export default function App() {
       setSortDir("desc");
     }
   };
+  // 只有第一次進入某個 tab 才播進場動畫，之後切換直接顯示
   const switchTab = (t) => {
-    setPrevTab(activeTab);
+    if (!visitedTabsRef.current[t]) {
+      visitedTabsRef.current[t] = true;
+      setAnimTab(t);
+    } else {
+      setAnimTab(null);
+    }
     setActiveTab(t);
-    setTabKey((k) => k + 1);
   };
   const cloudIcon =
     cloudState.includes("已連線") || cloudState.includes("已同步") ? (
@@ -1468,6 +1735,97 @@ export default function App() {
           onCancel={() => setConfirmDlg(null)}
         />
       )}
+      {showDataModal && (
+        <div
+          className="modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="資料管理"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowDataModal(false);
+          }}
+        >
+          <div className="modal" style={{ maxWidth: 460, textAlign: "left" }}>
+            <div
+              className="modal-title"
+              style={{ display: "flex", alignItems: "center", gap: 8 }}
+            >
+              <Download size={18} />
+              資料管理
+            </div>
+            <div className="modal-text">
+              CSV 適合在 Excel 編輯後匯回；JSON 備份包含目標與 FIRE
+              設定，適合完整搬移或災難復原。
+            </div>
+            <div className="data-actions">
+              <button
+                className="btn-ghost data-action"
+                onClick={() => {
+                  downloadCSV(records);
+                  setToast("CSV 已匯出");
+                }}
+              >
+                <Download size={15} />
+                匯出 CSV
+                <span className="data-hint">{records.length} 筆</span>
+              </button>
+              <button
+                className="btn-ghost data-action"
+                onClick={() => csvInputRef.current && csvInputRef.current.click()}
+              >
+                <Upload size={15} />
+                匯入 CSV
+                <span className="data-hint">同月份覆蓋、其餘保留</span>
+              </button>
+              <button className="btn-ghost data-action" onClick={downloadBackup}>
+                <Save size={15} />
+                下載 JSON 完整備份
+                <span className="data-hint">含目標與 FIRE 設定</span>
+              </button>
+              <button
+                className="btn-ghost data-action"
+                onClick={() =>
+                  jsonInputRef.current && jsonInputRef.current.click()
+                }
+              >
+                <Upload size={15} />
+                還原 JSON 備份
+                <span className="data-hint">完全取代現有資料</span>
+              </button>
+            </div>
+            <div className="modal-actions" style={{ marginTop: 16 }}>
+              <button
+                className="modal-cancel"
+                onClick={() => setShowDataModal(false)}
+              >
+                關閉
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <input
+        type="file"
+        accept=".csv,text/csv"
+        ref={csvInputRef}
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0];
+          e.target.value = "";
+          if (f) handleImportCSV(f);
+        }}
+      />
+      <input
+        type="file"
+        accept=".json,application/json"
+        ref={jsonInputRef}
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0];
+          e.target.value = "";
+          if (f) handleRestoreJSON(f);
+        }}
+      />
       <header className="header">
         <div className="header-left">
           <div className="brand-mark">
@@ -1504,9 +1862,9 @@ export default function App() {
           >
             {isDark ? <Sun size={16} /> : <Moon size={16} />}
           </button>
-          <button className="btn-ghost" onClick={() => downloadCSV(records)}>
+          <button className="btn-ghost" onClick={() => setShowDataModal(true)}>
             <Download size={14} />
-            匯出
+            資料
           </button>
           <button
             className="btn-primary"
@@ -1679,7 +2037,9 @@ export default function App() {
       )}
 
       {activeTab === "overview" && (
-        <div className="tab-enter" key={`ov-${tabKey}`}>
+        <div
+          className={`tab-enter ${animTab === "overview" ? "" : "no-anim"}`}
+        >
           {gapWarning && (
             <div className="stale-banner si si-0" role="status">
               <AlertTriangle size={15} />
@@ -1837,11 +2197,18 @@ export default function App() {
               <div className="kpi-sub">歷史高點回落</div>
             </div>
             <div className="kpi-item">
-              <div className="kpi-label">月波動度</div>
-              <div className="kpi-value mono" style={{ color: T.purple }}>
-                <AnimV value={stats.volatility} fmt={(v) => fmtPP(v)} />
+              <div className="kpi-label">年化報酬（TWR）</div>
+              <div
+                className="kpi-value mono"
+                style={{
+                  color: twrStats.ann >= 0 ? T.positive : T.negative,
+                }}
+              >
+                <AnimV value={twrStats.ann} fmt={(v) => fmtP(v)} />
               </div>
-              <div className="kpi-sub">{stats.totalMonths} 個月</div>
+              <div className="kpi-sub">
+                累計 {fmtP(twrStats.cum)}｜{stats.totalMonths} 個月
+              </div>
             </div>
           </section>
           <section className="signal-card si si-2">
@@ -2007,7 +2374,16 @@ export default function App() {
                   </span>
                   <span className="dist-label">勝率</span>
                 </div>
-                <span className="dist-count">{pd.length} 月</span>
+                <span
+                  className="dist-count"
+                  title={
+                    pd.length !== basisPd.length
+                      ? `已排除 ${pd.length - basisPd.length} 個未更新月份`
+                      : undefined
+                  }
+                >
+                  {basisPd.length} 月
+                </span>
               </div>
               <div style={{ height: 160 }}>
                 <ResponsiveContainer width="100%" height="100%">
@@ -2055,7 +2431,9 @@ export default function App() {
       )}
 
       {activeTab === "analysis" && (
-        <div className="tab-enter" key={`an-${tabKey}`}>
+        <div
+          className={`tab-enter ${animTab === "analysis" ? "" : "no-anim"}`}
+        >
           <section className="card si si-0">
             <div className="chart-header">
               <h3 className="card-title">趨勢分析</h3>
@@ -2066,6 +2444,7 @@ export default function App() {
                     { key: "assets", label: "總資產" },
                     { key: "invested", label: "投資" },
                     { key: "composite", label: "複合" },
+                    { key: "twr", label: "累積報酬" },
                   ].map((it) => (
                     <button
                       key={it.key}
@@ -2218,6 +2597,64 @@ export default function App() {
                       ))}
                     </Bar>
                   </ComposedChart>
+                ) : chartType === "twr" ? (
+                  <AreaChart data={trendData}>
+                    <defs>
+                      <linearGradient id="tG" x1="0" y1="0" x2="0" y2="1">
+                        <stop
+                          offset="5%"
+                          stopColor={T.purple}
+                          stopOpacity={0.2}
+                        />
+                        <stop
+                          offset="95%"
+                          stopColor={T.purple}
+                          stopOpacity={0}
+                        />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      vertical={false}
+                      stroke={
+                        isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)"
+                      }
+                    />
+                    <XAxis
+                      dataKey="month"
+                      tickFormatter={fmtMS}
+                      minTickGap={18}
+                      interval="preserveStartEnd"
+                      axisLine={false}
+                      tickLine={false}
+                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                    />
+                    <YAxis
+                      axisLine={false}
+                      tickLine={false}
+                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      unit="%"
+                    />
+                    <Tooltip
+                      content={
+                        <CTip
+                          mode="twr"
+                          onHover={setHoveredMonth}
+                          privacy={privacy}
+                        />
+                      }
+                      cursor={<ChartCursor height={340} />}
+                    />
+                    <ReferenceLine y={0} stroke={T.border} />
+                    <Area
+                      type="monotone"
+                      dataKey="cumulativeTwrRate"
+                      stroke={T.purple}
+                      fill="url(#tG)"
+                      strokeWidth={2.5}
+                      dot={false}
+                    />
+                  </AreaChart>
                 ) : (
                   <AreaChart data={trendData}>
                     <defs>
@@ -2325,6 +2762,151 @@ export default function App() {
                   <b className="mono">{mask(fmtS(hoveredData.cashAssets))}</b>
                 </span>
               </div>
+            )}
+          </section>
+          <section className="card si si-1">
+            <div className="chart-header">
+              <div>
+                <h3 className="card-title">
+                  <TrendingUp size={18} className="icon-gold" />
+                  成長貢獻分解
+                </h3>
+                <p className="card-desc">
+                  總資產＝起始資產＋累計投入＋累計報酬，看清成長來自存錢還是市場
+                </p>
+              </div>
+              {contribData && (
+                <div className="contrib-stats mono">
+                  投入{" "}
+                  <b style={{ color: T.cyan }}>
+                    {mask(fmtS(contribData.totalInflow))}
+                  </b>
+                  {contribData.growth > 0 &&
+                    !privacy &&
+                    ` (${(
+                      (contribData.totalInflow / contribData.growth) *
+                      100
+                    ).toFixed(0)}%)`}
+                  ｜報酬{" "}
+                  <b
+                    style={{
+                      color:
+                        contribData.totalGain >= 0 ? T.positive : T.negative,
+                    }}
+                  >
+                    {mask(fmtS(contribData.totalGain))}
+                  </b>
+                  {contribData.growth > 0 &&
+                    !privacy &&
+                    ` (${(
+                      (contribData.totalGain / contribData.growth) *
+                      100
+                    ).toFixed(0)}%)`}
+                </div>
+              )}
+            </div>
+            {contribData ? (
+              <>
+                <div className="chart-wrap">
+                  <ResponsiveContainer width="100%" height={300}>
+                    <ComposedChart data={contribData.rows}>
+                      <defs>
+                        <linearGradient id="ciG" x1="0" y1="0" x2="0" y2="1">
+                          <stop
+                            offset="5%"
+                            stopColor={T.cyan}
+                            stopOpacity={0.35}
+                          />
+                          <stop
+                            offset="95%"
+                            stopColor={T.cyan}
+                            stopOpacity={0.08}
+                          />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        vertical={false}
+                        stroke={
+                          isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)"
+                        }
+                      />
+                      <XAxis
+                        dataKey="month"
+                        tickFormatter={fmtMS}
+                        minTickGap={18}
+                        interval="preserveStartEnd"
+                        axisLine={false}
+                        tickLine={false}
+                        tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      />
+                      <YAxis
+                        axisLine={false}
+                        tickLine={false}
+                        tick={{ fill: T.textTertiary, fontSize: 11 }}
+                        tickFormatter={(v) =>
+                          privacy ? "•" : `${(v / 1e4).toFixed(0)}萬`
+                        }
+                      />
+                      <Tooltip
+                        content={<ContribTip privacy={privacy} />}
+                        cursor={<ChartCursor height={300} />}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="base"
+                        name="起始資產"
+                        stackId="c"
+                        stroke="none"
+                        fill={
+                          isDark
+                            ? "rgba(255,255,255,0.08)"
+                            : "rgba(28,28,30,0.08)"
+                        }
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="cumInflow"
+                        name="累計投入"
+                        stackId="c"
+                        stroke={T.cyan}
+                        strokeWidth={1.5}
+                        fill="url(#ciG)"
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="total"
+                        name="總資產"
+                        stroke={T.gold}
+                        strokeWidth={2.5}
+                        dot={false}
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="contrib-legend">
+                  <span>
+                    <i
+                      style={{
+                        background: isDark
+                          ? "rgba(255,255,255,0.2)"
+                          : "rgba(28,28,30,0.2)",
+                      }}
+                    />
+                    起始資產
+                  </span>
+                  <span>
+                    <i style={{ background: T.cyan }} />
+                    累計投入
+                  </span>
+                  <span>
+                    <i style={{ background: T.gold }} />
+                    總資產（與堆疊頂的落差＝累計報酬）
+                  </span>
+                </div>
+              </>
+            ) : (
+              <div className="preview-empty">至少需要 2 個月資料</div>
             )}
           </section>
           <div className="two-col si si-1">
@@ -2438,11 +3020,80 @@ export default function App() {
               </div>
             </section>
           </div>
+          <section className="card si si-2">
+            <h3 className="card-title">
+              <CalendarDays size={18} className="icon-gold" />
+              月報酬熱力圖
+            </h3>
+            <p className="card-desc">
+              綠＝正報酬、紅＝負報酬，越深幅度越大；斜線＝該月未更新總資產
+            </p>
+            <div className="heatmap-wrap">
+              <div className="heatmap-grid">
+                <div />
+                {Array.from({ length: 12 }, (_, i) => (
+                  <div key={`h${i}`} className="hm-head mono">
+                    {i + 1}月
+                  </div>
+                ))}
+                {heatmapYears.map((y) => (
+                  <React.Fragment key={y.year}>
+                    <div className="hm-year mono">{y.year}</div>
+                    {Array.from({ length: 12 }, (_, i) => {
+                      const r = y.months[i + 1];
+                      if (!r)
+                        return (
+                          <div
+                            key={`${y.year}-${i}`}
+                            className="hm-cell hm-empty"
+                          />
+                        );
+                      const flat =
+                        Number(r.prevAssets) !== 0 &&
+                        Number(r.totalAssets) === Number(r.prevAssets);
+                      const alpha =
+                        Math.min(Math.abs(r.returnRate) / 6, 1) * 0.6 + 0.15;
+                      return (
+                        <div
+                          key={`${y.year}-${i}`}
+                          className={`hm-cell mono ${flat ? "hm-flat" : ""}`}
+                          style={
+                            flat
+                              ? undefined
+                              : {
+                                  background: hexA(
+                                    r.returnRate >= 0
+                                      ? T.positive
+                                      : T.negative,
+                                    alpha
+                                  ),
+                                  color: alpha > 0.45 ? "#fff" : T.text,
+                                }
+                          }
+                          title={`${r.month}　${fmtP(r.returnRate)}${
+                            flat ? "（未更新）" : ""
+                          }`}
+                        >
+                          {flat
+                            ? "—"
+                            : `${
+                                r.returnRate >= 0 ? "+" : ""
+                              }${r.returnRate.toFixed(1)}`}
+                        </div>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          </section>
         </div>
       )}
 
       {activeTab === "records" && (
-        <div className="tab-enter" key={`rc-${tabKey}`}>
+        <div
+          className={`tab-enter ${animTab === "records" ? "" : "no-anim"}`}
+        >
           <section className="card si si-0">
             <div className="table-header">
               <h3 className="card-title">每月明細</h3>
@@ -2496,7 +3147,6 @@ export default function App() {
                     <th className="th-r">投資</th>
                     <th className="th-r">淨投入</th>
                     <th className="th-r">淨提領</th>
-                    <th className="th-r">現金流</th>
                     <ThS
                       col="returnRate"
                       cur={sortCol}
@@ -2543,9 +3193,6 @@ export default function App() {
                           }}
                         >
                           {row.netOut > 0 ? mask(fmtN(row.netOut)) : "—"}
-                        </td>
-                        <td className="td-r mono">
-                          {mask(fmtN(row.netCashFlow))}
                         </td>
                         <td className="td-r">
                           <div className="return-cell">
@@ -2605,7 +3252,7 @@ export default function App() {
                   })}
                   {!tableData.length && (
                     <tr>
-                      <td colSpan="10" className="empty-cell">
+                      <td colSpan="9" className="empty-cell">
                         查無資料
                       </td>
                     </tr>
@@ -2618,7 +3265,9 @@ export default function App() {
       )}
 
       {activeTab === "scenario" && (
-        <div className="tab-enter" key={`sc-${tabKey}`}>
+        <div
+          className={`tab-enter ${animTab === "scenario" ? "" : "no-anim"}`}
+        >
           <section className="card si si-0">
             <div className="chart-header">
               <div>
@@ -2913,6 +3562,115 @@ export default function App() {
               </span>
             </div>
           </section>
+          <section className="card si si-4">
+            <h3 className="card-title">
+              <Banknote size={18} className="icon-gold" />
+              財務自由（FIRE）
+            </h3>
+            <p className="card-desc">
+              4% 法則：自由數字＝年支出 ×
+              25。沿用上方相同的模擬假設（μ／月投入），最長推算 20 年。
+            </p>
+            <div className="fire-grid">
+              <div>
+                <div className="goal-input-wrap">
+                  <span className="goal-prefix mono">年支出 NT$</span>
+                  <input
+                    className="goal-input mono"
+                    type="number"
+                    placeholder="例如 600000"
+                    aria-label="年支出"
+                    value={fireInput}
+                    onChange={(e) => {
+                      setFireInput(e.target.value);
+                      setFireExpense(Number(e.target.value) || 0);
+                    }}
+                  />
+                </div>
+                {fireStats ? (
+                  <div className="goal-body">
+                    <PRow
+                      l="自由數字（×25）"
+                      v={mask(`NT$ ${fmtN(fireStats.fireNumber)}`)}
+                      c={T.gold}
+                    />
+                    <div className="progress-track">
+                      <div
+                        className="progress-fill"
+                        style={{
+                          width: `${fireStats.progress}%`,
+                          background:
+                            fireStats.progress >= 100 ? T.positive : T.gold,
+                        }}
+                      />
+                    </div>
+                    <div className="goal-meta">
+                      <span
+                        className="mono"
+                        style={{ color: T.gold, fontWeight: 700 }}
+                      >
+                        {fireStats.progress.toFixed(1)}%
+                      </span>
+                      <span style={{ color: T.textTertiary }}>
+                        差{" "}
+                        {mask(
+                          fmtS(
+                            Math.max(
+                              0,
+                              fireStats.fireNumber - stats.totalAssets
+                            )
+                          )
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="preview-empty">
+                    輸入年支出，推算財務自由時程
+                  </div>
+                )}
+              </div>
+              <div className="fire-reach">
+                {fireStats && latest ? (
+                  fireStats.reach.map((r) => {
+                    const c = {
+                      bull: T.positive,
+                      base: T.gold,
+                      bear: T.negative,
+                    }[r.key];
+                    let label;
+                    if (r.idx === 0) label = "已達成 ✦";
+                    else if (r.idx < 0) label = "20 年內未達成";
+                    else {
+                      const yy = Math.floor(r.idx / 12),
+                        mm = r.idx % 12,
+                        parts = [];
+                      if (yy) parts.push(`${yy} 年`);
+                      if (mm) parts.push(`${mm} 個月`);
+                      label = `${parts.join(" ")}後（${addMonths(
+                        latest.month,
+                        r.idx
+                      )}）`;
+                    }
+                    return (
+                      <div key={r.key} className="a-row">
+                        <span className="a-row-l">
+                          <span
+                            className="ct-dot"
+                            style={{ background: c }}
+                          />
+                          {r.label}
+                        </span>
+                        <span className="a-row-v mono">{label}</span>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="preview-empty">—</div>
+                )}
+              </div>
+            </div>
+          </section>
         </div>
       )}
     </div>
@@ -3057,6 +3815,9 @@ function CTip({ active, payload, label, mode, onHover, privacy }) {
   } else if (mode === "drawdown") {
     t = fmtPP(v);
     s = "距歷史高點";
+  } else if (mode === "twr") {
+    t = fmtP(v);
+    s = "累積報酬（TWR）";
   } else {
     t = mm(`NT$ ${fmtN(v)}`);
     s = "總資產";
@@ -3088,6 +3849,30 @@ function ScTip({ active, payload, label, privacy }) {
           <span className="mono">
             {privacy ? "＊＊＊＊＊" : `NT$ ${fmtS(p.value)}`}
           </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+function ContribTip({ active, payload, label, privacy }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  const mm = (v) => (privacy ? "＊＊＊＊＊" : fmtS(v));
+  const rows = [
+    { l: "起始資產", v: d.base, c: T.textTertiary },
+    { l: "累計投入", v: d.cumInflow, c: T.cyan },
+    { l: "累計報酬", v: d.cumGain, c: d.cumGain >= 0 ? T.positive : T.negative },
+    { l: "總資產", v: d.total, c: T.gold },
+  ];
+  return (
+    <div className="chart-tooltip">
+      <div className="ct-label mono">{label}</div>
+      {rows.map((r) => (
+        <div key={r.l} className="ct-row">
+          <span className="ct-dot" style={{ background: r.c }} />
+          <span style={{ minWidth: 60 }}>{r.l}</span>
+          <span className="mono">{mm(r.v)}</span>
         </div>
       ))}
     </div>
@@ -3381,6 +4166,30 @@ table{border-collapse:collapse}
 .modal-cancel:hover{color:${T.text}}
 .modal-confirm{background:${T.negative};color:#fff}
 .modal-confirm:hover{box-shadow:0 4px 14px rgba(0,0,0,0.25)}
+
+.no-anim,.no-anim .si,.no-anim .stagger-in{animation:none!important}
+
+.data-actions{display:flex;flex-direction:column;gap:8px}
+.data-action{width:100%;justify-content:flex-start}
+.data-hint{margin-left:auto;font-size:11px;color:${T.textTertiary};font-weight:500}
+
+.contrib-stats{font-size:12px;color:${T.textSecondary};white-space:nowrap}
+.contrib-stats b{font-weight:600}
+.contrib-legend{display:flex;gap:16px;justify-content:center;margin-top:10px;font-size:11px;color:${T.textTertiary};flex-wrap:wrap}
+.contrib-legend span{display:inline-flex;align-items:center;gap:5px}
+.contrib-legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+
+.fire-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:12px}
+@media(max-width:768px){.fire-grid{grid-template-columns:1fr}}
+.fire-reach{display:flex;flex-direction:column;gap:12px;justify-content:center}
+
+.heatmap-wrap{overflow-x:auto;margin-top:12px}
+.heatmap-grid{display:grid;grid-template-columns:44px repeat(12,minmax(44px,1fr));gap:4px;min-width:660px}
+.hm-head{font-size:10px;color:${T.textTertiary};text-align:center;font-weight:600;padding:2px 0}
+.hm-year{font-size:11px;color:${T.textSecondary};font-weight:600;display:flex;align-items:center}
+.hm-cell{height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;border:1px solid ${T.border};color:${T.text}}
+.hm-empty{border-style:dashed;opacity:0.35}
+.hm-flat{color:${T.textTertiary};background:repeating-linear-gradient(45deg,transparent,transparent 4px,${T.border} 4px,${T.border} 5px)}
 
 .hover-kpi-strip{display:flex;align-items:center;gap:16px;padding:10px 16px;margin-top:10px;background:${T.goldLight};border:1px solid ${T.borderAccent};border-radius:10px;font-size:12px;color:${T.textSecondary};flex-wrap:wrap;animation:staggerIn 0.2s ease-out}
 .hover-kpi-label{font-weight:700;color:${T.gold};font-size:13px;padding-right:10px;border-right:1px solid ${T.borderAccent}}
