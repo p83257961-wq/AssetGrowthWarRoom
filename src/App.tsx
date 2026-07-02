@@ -1602,13 +1602,18 @@ export default function App() {
     reader.readAsText(file, "utf-8");
   };
   const downloadBackup = () => {
+    let allocation = null;
+    try {
+      if (localStorage.getItem(AW_STORAGE_KEY)) allocation = loadFromLocalStorage();
+    } catch {}
     const payload = {
       app: "asset-growth-war-room",
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       goalValue: goalValue || 0,
       fireExpense: fireExpense || 0,
       records: normalizeRecords(records),
+      allocation,
     };
     const b = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
@@ -1642,8 +1647,12 @@ export default function App() {
           title: "還原備份",
           message: `備份含 ${recs.length} 筆（${recs[0].month} ~ ${
             recs[recs.length - 1].month
-          }），將完全取代現有 ${records.length} 筆資料。`,
-          onConfirm: () => {
+          }），將完全取代現有 ${records.length} 筆資料。${
+            p.allocation && Array.isArray(p.allocation.assets)
+              ? `資產配置（${p.allocation.assets.length} 項）也會一併還原。`
+              : ""
+          }`,
+          onConfirm: async () => {
             setRecords(recs);
             if (p.goalValue) {
               setGoalValue(Number(p.goalValue));
@@ -1652,6 +1661,26 @@ export default function App() {
             if (p.fireExpense) {
               setFireInput(String(p.fireExpense));
               setFireExpense(Number(p.fireExpense));
+            }
+            // 資產配置：直接寫回其雲端文件，分頁的 onSnapshot 會即時同步
+            if (p.allocation && Array.isArray(p.allocation.assets)) {
+              try {
+                const { db } = getFirebaseServices();
+                await setDoc(
+                  doc(db, AW_CLOUD_DOC.collection, AW_CLOUD_DOC.doc),
+                  {
+                    assets: p.allocation.assets,
+                    refData: p.allocation.refData || INITIAL_REF_DATA,
+                    snapshots: Array.isArray(p.allocation.snapshots)
+                      ? p.allocation.snapshots
+                      : [],
+                    categoryOrder: Array.isArray(p.allocation.categoryOrder)
+                      ? p.allocation.categoryOrder
+                      : DEFAULT_CATEGORY_ORDER,
+                    updatedAt: new Date().toISOString(),
+                  }
+                );
+              } catch {}
             }
             setToast("已還原備份");
           },
@@ -1692,6 +1721,42 @@ export default function App() {
       netOut: "0",
       note: "",
     });
+  };
+  // 從「資產配置」分頁帶入目前總資產與現金（同一份 localStorage，資料即時）
+  const importFromAllocation = () => {
+    try {
+      const raw = localStorage.getItem(AW_STORAGE_KEY);
+      if (!raw) {
+        setToast("資產配置尚無資料");
+        return;
+      }
+      const d = loadFromLocalStorage();
+      if (!d.assets || !d.assets.length) {
+        setToast("資產配置尚無資料");
+        return;
+      }
+      const fx = Number(d.refData && d.refData.usdToTwd) || 32;
+      const total = Math.round(
+        d.assets.reduce((sum, a) => sum + convertAssetToTwd(a, fx), 0)
+      );
+      const cash = Math.round(
+        d.assets
+          .filter((a) => a.category === "現金")
+          .reduce((sum, a) => sum + convertAssetToTwd(a, fx), 0)
+      );
+      setFormData((prev) => ({
+        ...prev,
+        totalAssets: String(total),
+        cashAssets: String(cash),
+      }));
+      setToast(
+        privacy
+          ? "已帶入資產配置數值"
+          : `已帶入：總資產 ${fmtN(total)}／現金 ${fmtN(cash)}`
+      );
+    } catch {
+      setToast("帶入失敗");
+    }
   };
   const handleSort = (col) => {
     if (sortCol === col) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -1787,7 +1852,7 @@ export default function App() {
             </div>
             <div className="modal-text">
               CSV 適合在 Excel 編輯後匯回；JSON 備份包含目標與 FIRE
-              設定，適合完整搬移或災難復原。
+              設定，適合完整搬移或災難復原（含「資產配置」分頁全部資料）。
             </div>
             <div className="data-actions">
               <button
@@ -1812,7 +1877,7 @@ export default function App() {
               <button className="btn-ghost data-action" onClick={downloadBackup}>
                 <Save size={15} />
                 下載 JSON 完整備份
-                <span className="data-hint">含目標與 FIRE 設定</span>
+                <span className="data-hint">含目標、FIRE、資產配置</span>
               </button>
               <button
                 className="btn-ghost data-action"
@@ -1952,12 +2017,22 @@ export default function App() {
                 {mask(`NT$ ${fmtN(latest?.totalAssets || 0)}`)}
               </p>
             </div>
-            {editingMonth && (
-              <span className="badge badge-blue">
-                <Pencil size={12} />
-                編輯中
-              </span>
-            )}
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                className="btn-ghost"
+                onClick={importFromAllocation}
+                title="讀取「資產配置」分頁目前的總資產與現金"
+              >
+                <Wallet size={14} />
+                從資產配置帶入
+              </button>
+              {editingMonth && (
+                <span className="badge badge-blue">
+                  <Pencil size={12} />
+                  編輯中
+                </span>
+              )}
+            </div>
           </div>
           {gapWarning && (
             <div className="alert alert-warn">
@@ -4773,7 +4848,7 @@ button,input,select{font:inherit;}
 .mobile-asset-card-field-label{font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--c-text-3);font-weight:700;}
 .mobile-asset-card-field-value{font-size:13px;font-weight:700;color:var(--c-text);font-family:var(--mono);}
 
-.settings-title{.settings-title{display:flex;align-items:center;gap:8px;font-size:18px;font-weight:800;color:var(--c-text);margin-bottom:20px;}
+.settings-title{display:flex;align-items:center;gap:8px;font-size:18px;font-weight:800;color:var(--c-text);margin-bottom:20px;}
 .form-group+.form-group{margin-top:18px;}
 .form-label{display:block;margin-bottom:8px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--c-text-3);font-weight:700;}
 .form-input{width:100%;height:48px;border-radius:var(--radius-sm);border:1px solid var(--c-border-2);background:var(--c-surface-2);padding:0 14px;text-align:right;font-size:18px;font-family:var(--mono);font-weight:700;color:var(--c-text);outline:none;}
