@@ -470,6 +470,7 @@ function migrateRecord(r) {
     otherAssets: o,
     netIn: Number(r.netIn || 0),
     netOut: Number(r.netOut || 0),
+    liabilities: Number(r.liabilities || 0),
     note: r.note || "",
   };
 }
@@ -619,6 +620,7 @@ function calcProcessed(records) {
       drawdown: tp === 0 ? 0 : ((tA - tp) / tp) * 100,
       investedDrawdown: ip === 0 ? 0 : ((iA - ip) / ip) * 100,
       cumulativeTwrRate: (ct - 1) * 100,
+      netWorth: tA - Number(r.liabilities || 0),
     };
   });
 }
@@ -727,6 +729,7 @@ function toCSV(r) {
     "otherAssets",
     "netIn",
     "netOut",
+    "liabilities",
     "note",
   ];
   return [
@@ -793,6 +796,7 @@ function parseCSVRecords(text) {
     "otherAssets",
     "netIn",
     "netOut",
+    "liabilities",
     "note",
   ].forEach((k) => {
     idx[k] = header.indexOf(k);
@@ -810,6 +814,7 @@ function parseCSVRecords(text) {
       otherAssets: idx.otherAssets >= 0 ? c[idx.otherAssets] : "",
       netIn: idx.netIn >= 0 ? Number(c[idx.netIn] || 0) : 0,
       netOut: idx.netOut >= 0 ? Number(c[idx.netOut] || 0) : 0,
+      liabilities: idx.liabilities >= 0 ? Number(c[idx.liabilities] || 0) : 0,
       note: idx.note >= 0 ? String(c[idx.note] || "") : "",
     });
   }
@@ -1033,6 +1038,7 @@ export default function App() {
     otherAssets: "0",
     netIn: "0",
     netOut: "0",
+    liabilities: "0",
     note: "",
   });
 
@@ -1270,6 +1276,10 @@ export default function App() {
       growth: last.total - base,
     };
   }, [pd]);
+  const hasLiab = useMemo(
+    () => pd.some((r) => Number(r.liabilities || 0) > 0),
+    [pd]
+  );
   const heatmapYears = useMemo(() => {
     const map = {};
     pd.forEach((r) => {
@@ -1359,6 +1369,8 @@ export default function App() {
         cashRatio: 0,
         totalMonths: 0,
         volatility: 0,
+        liabilities: 0,
+        netWorth: 0,
       };
     const cy = getYear(latest.month),
       yr = pd.filter((r) => getYear(r.month) === cy);
@@ -1415,6 +1427,8 @@ export default function App() {
       cashRatio: cr,
       totalMonths: pd.length,
       volatility: vol,
+      liabilities: Number(latest.liabilities || 0),
+      netWorth: latest.netWorth ?? latest.totalAssets,
     };
   }, [latest, pd, basisPd]);
 
@@ -1424,6 +1438,7 @@ export default function App() {
     if (!formData.totalAssets || Number(formData.totalAssets) <= 0)
       e.push("總資產>0");
     if (Number(formData.cashAssets || 0) < 0) e.push("現金≥0");
+    if (Number(formData.liabilities || 0) < 0) e.push("負債≥0");
     if (
       Number(formData.cashAssets || 0) + Number(formData.otherAssets || 0) >
       Number(formData.totalAssets || 0)
@@ -1534,6 +1549,7 @@ export default function App() {
       otherAssets: Number(formData.otherAssets || 0),
       netIn: Number(formData.netIn || 0),
       netOut: Number(formData.netOut || 0),
+      liabilities: Number(formData.liabilities || 0),
       note: formData.note || "",
     };
     const ex = records.some((r) => r.month === c.month);
@@ -1734,6 +1750,7 @@ export default function App() {
       otherAssets: String(row.otherAssets ?? 0),
       netIn: String(row.netIn ?? 0),
       netOut: String(row.netOut ?? 0),
+      liabilities: String(row.liabilities ?? 0),
       note: row.note || "",
     });
     setShowForm(true);
@@ -1753,6 +1770,7 @@ export default function App() {
       otherAssets: latest ? String(latest.otherAssets) : "0",
       netIn: latest ? String(latest.netIn) : "0",
       netOut: "0",
+      liabilities: latest ? String(latest.liabilities || 0) : "0",
       note: "",
     });
   };
@@ -2112,6 +2130,12 @@ export default function App() {
                 value={formData.netOut}
                 onChange={(v) => setFormData((p) => ({ ...p, netOut: v }))}
               />
+              <FF
+                label="負債(選填)"
+                type="number"
+                value={formData.liabilities}
+                onChange={(v) => setFormData((p) => ({ ...p, liabilities: v }))}
+              />
               <div className="form-field full">
                 <label className="field-label">備註</label>
                 <input
@@ -2246,6 +2270,15 @@ export default function App() {
               </span>
               <span className="hero-sep">|</span>
               <span className="hero-date">截至 {stats.lastMonth}</span>
+              {stats.liabilities > 0 && (
+                <>
+                  <span className="hero-sep">|</span>
+                  <span className="hero-date">
+                    負債 {mask(fmtS(stats.liabilities))}｜淨值{" "}
+                    {mask(fmtS(stats.netWorth))}
+                  </span>
+                </>
+              )}
             </div>
           </section>
           <section className="kpi-strip si si-1">
@@ -2863,6 +2896,17 @@ export default function App() {
                       }}
                       activeDot={{ r: 5, stroke: T.surface, strokeWidth: 2 }}
                     />
+                    {chartType === "assets" && hasLiab && (
+                      <Area
+                        type="monotone"
+                        dataKey="netWorth"
+                        stroke={T.purple}
+                        fill="none"
+                        strokeWidth={2}
+                        strokeDasharray="5 3"
+                        dot={false}
+                      />
+                    )}
                   </AreaChart>
                 )}
               </ResponsiveContainer>
@@ -3289,6 +3333,7 @@ export default function App() {
                     <th className="th-r">投資</th>
                     <th className="th-r">淨投入</th>
                     <th className="th-r">淨提領</th>
+                    {hasLiab && <th className="th-r">負債</th>}
                     <ThS
                       col="returnRate"
                       cur={sortCol}
@@ -3336,6 +3381,16 @@ export default function App() {
                         >
                           {row.netOut > 0 ? mask(fmtN(row.netOut)) : "—"}
                         </td>
+                        {hasLiab && (
+                          <td
+                            className="td-r mono"
+                            style={{ color: T.textTertiary }}
+                          >
+                            {row.liabilities > 0
+                              ? mask(fmtN(row.liabilities))
+                              : "—"}
+                          </td>
+                        )}
                         <td className="td-r">
                           <div className="return-cell">
                             <div className="return-bar-track">
@@ -3394,7 +3449,7 @@ export default function App() {
                   })}
                   {!tableData.length && (
                     <tr>
-                      <td colSpan="9" className="empty-cell">
+                      <td colSpan={hasLiab ? 10 : 9} className="empty-cell">
                         查無資料
                       </td>
                     </tr>
@@ -3966,7 +4021,9 @@ function CTip({ active, payload, label, mode, onHover, privacy }) {
     s = "累積報酬（TWR）";
   } else {
     t = mm(`NT$ ${fmtN(v)}`);
-    s = "總資產";
+    s = payload[1]
+      ? `總資產｜淨值 ${mm(`NT$ ${fmtN(payload[1].value)}`)}`
+      : "總資產";
   }
   return (
     <div className="chart-tooltip">
