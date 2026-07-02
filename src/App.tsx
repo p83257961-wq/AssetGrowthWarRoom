@@ -172,21 +172,25 @@ let T = THEMES.dark;
 /* ─── Animated Number ─── */
 function useAnimNum(target, dur = 600) {
   const [d, setD] = useState(target);
-  const prev = useRef(target);
+  // shown 追蹤畫面上實際顯示的值：動畫中途換目標時從當前值接續，
+  // 不會跳回舊動畫的起點（原本 prev 只在動畫完成時更新，中途 retarget 會視覺跳動）
+  const shown = useRef(target);
   const fr = useRef(null);
   useEffect(() => {
-    const from = prev.current,
+    const from = shown.current,
       to = target;
     if (from === to) return;
     const st = performance.now();
     const tick = (now) => {
       const p = Math.min((now - st) / dur, 1);
       const e = 1 - Math.pow(1 - p, 3);
-      setD(from + (to - from) * e);
+      const v = from + (to - from) * e;
+      shown.current = v;
+      setD(v);
       if (p < 1) fr.current = requestAnimationFrame(tick);
       else {
+        shown.current = to;
         setD(to);
-        prev.current = to;
       }
     };
     fr.current = requestAnimationFrame(tick);
@@ -203,6 +207,16 @@ function AnimV({ value, fmt = (v) => fmtS(v), className = "", style = {} }) {
       {fmt(a)}
     </span>
   );
+}
+
+/* 連續輸入（滑桿）的防抖：UI 顯示用即時值，昂貴計算改吃延遲值 */
+function useDebouncedValue(value, delay = 150) {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return v;
 }
 
 /* ─── Crosshair Cursor for Charts ─── */
@@ -893,19 +907,25 @@ function projectScenarios(
     }
     paths.push(pts);
   }
-  const pct = (i, q) => {
-    const arr = paths.map((pt) => pt[i]).sort((a, b) => a - b);
-    return arr[Math.min(N - 1, Math.floor(q * N))];
-  };
   const defs = [
     { key: "bull", label: "樂觀 P90", q: 0.9 },
     { key: "base", label: "基準 P50", q: 0.5 },
     { key: "bear", label: "保守 P10", q: 0.1 },
   ];
-  return defs.map((d) => {
-    const points = [];
-    for (let i = 0; i <= months; i++)
-      points.push({ month: i, value: pct(i, d.q) });
+  // 每個時間點只排序一次、三個百分位共用
+  //（原本 pct(i,q) 每次呼叫都重排 500 元素，FIRE 的 241 點 × 3 分位要排 723 次）
+  const pointsByDef = defs.map(() => []);
+  for (let i = 0; i <= months; i++) {
+    const arr = paths.map((pt) => pt[i]).sort((a, b) => a - b);
+    defs.forEach((d, di) => {
+      pointsByDef[di].push({
+        month: i,
+        value: arr[Math.min(N - 1, Math.floor(d.q * N))],
+      });
+    });
+  }
+  return defs.map((d, di) => {
+    const points = pointsByDef[di];
     return {
       ...d,
       points,
@@ -922,8 +942,9 @@ function cashRC(r) {
 
 /* ═══════════ MAIN APP ═══════════ */
 export default function App() {
-  const loaded = safeLoadLocal();
-  const [records, setRecords] = useState(loaded.records);
+  // lazy initializer：localStorage 只在首次 render 解析一次
+  //（原本每次 render 都跑 safeLoadLocal()，表單每打一個字就重新 JSON.parse 整份紀錄）
+  const [records, setRecords] = useState(() => safeLoadLocal().records);
   const [chartType, setChartType] = useState("return");
   const [trendRange, setTrendRange] = useState("12");
   const [filterYear, setFilterYear] = useState("ALL");
@@ -945,6 +966,9 @@ export default function App() {
   const [sortDir, setSortDir] = useState("desc");
   const [scenarioRate, setScenarioRate] = useState(null);
   const [scenarioInflow, setScenarioInflow] = useState(null);
+  // 滑桿顯示用即時值；Monte Carlo 吃 150ms 防抖值，拖曳時不會每個 tick 重跑 500 條路徑
+  const debScenarioRate = useDebouncedValue(scenarioRate, 150);
+  const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
   const [animTab, setAnimTab] = useState("overview");
   const visitedTabsRef = useRef({ overview: true });
   const [showDataModal, setShowDataModal] = useState(false);
@@ -996,9 +1020,10 @@ export default function App() {
   }, [showDataModal]);
   const remoteAppliedRef = useRef(false);
   const saveTimerRef = useRef(null);
-  const remoteJsonRef = useRef(
-    JSON.stringify(normalizeRecords(loaded.records))
-  );
+  // lazy init：stringify 只在首次 render 執行一次；此初值僅在雲端 snapshot 到達前有意義
+  const remoteJsonRef = useRef(null);
+  if (remoteJsonRef.current === null)
+    remoteJsonRef.current = JSON.stringify(normalizeRecords(records));
   const remoteGoalRef = useRef(0);
   const remoteFireRef = useRef(0);
   const [formData, setFormData] = useState({
@@ -1057,17 +1082,20 @@ export default function App() {
                 remoteJsonRef.current = rj;
                 remoteAppliedRef.current = true;
                 setCloudReady(true);
+                // != null 而非 truthy：0（已清除）也要同步到其他裝置，只有欄位不存在才跳過
                 const rg = snap.data()?.goalValue;
-                if (rg) {
-                  setGoalInput(String(rg));
-                  setGoalValue(Number(rg));
-                  remoteGoalRef.current = Number(rg);
+                if (rg != null) {
+                  const n = Number(rg) || 0;
+                  setGoalInput(n ? String(n) : "");
+                  setGoalValue(n);
+                  remoteGoalRef.current = n;
                 }
                 const rf = snap.data()?.fireExpense;
-                if (rf) {
-                  setFireInput(String(rf));
-                  setFireExpense(Number(rf));
-                  remoteFireRef.current = Number(rf);
+                if (rf != null) {
+                  const n = Number(rf) || 0;
+                  setFireInput(n ? String(n) : "");
+                  setFireExpense(n);
+                  remoteFireRef.current = n;
                 }
                 setRecords((cur) => {
                   if (JSON.stringify(normalizeRecords(cur)) === rj) return cur;
@@ -1185,11 +1213,11 @@ export default function App() {
             pd,
             latest.totalAssets,
             scenarioMonths,
-            scenarioRate,
-            scenarioInflow
+            debScenarioRate,
+            debScenarioInflow
           )
         : [],
-    [pd, latest, scenarioMonths, scenarioRate, scenarioInflow]
+    [pd, latest, scenarioMonths, debScenarioRate, debScenarioInflow]
   );
   const scenarioDefaults = useMemo(() => getScenarioStats(pd), [pd]);
   const scData = useMemo(
@@ -1273,8 +1301,8 @@ export default function App() {
       pd,
       latest.totalAssets,
       240,
-      scenarioRate,
-      scenarioInflow
+      debScenarioRate,
+      debScenarioInflow
     );
     const reach = sc.map((s) => ({
       key: s.key,
@@ -1286,7 +1314,7 @@ export default function App() {
       reach,
       progress: Math.min(100, (latest.totalAssets / fireNumber) * 100),
     };
-  }, [fireExpense, latest, pd, scenarioRate, scenarioInflow]);
+  }, [fireExpense, latest, pd, debScenarioRate, debScenarioInflow]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
     const cur = latest.totalAssets,
@@ -1435,8 +1463,14 @@ export default function App() {
     const pA = prev ? Number(prev.totalAssets) : 0,
       ncf = Number(formData.netIn || 0) - Number(formData.netOut || 0),
       ng = tA - pA - ncf;
-    const rr = pA === 0 ? 0 : (ng / pA) * 100,
-      ath = Math.max(...records.map((r) => Number(r.totalAssets || 0)), 0);
+    const rr = pA === 0 ? 0 : (ng / pA) * 100;
+    // ATH 排除正在編輯的月份本身：編輯 ATH 當月時才不會跟自己的舊值比較而漏掉新高徽章
+    const ath = Math.max(
+      ...records
+        .filter((r) => r.month !== formData.month)
+        .map((r) => Number(r.totalAssets || 0)),
+      0
+    );
     return {
       prevAssets: pA,
       netGain: ng,
@@ -5190,13 +5224,47 @@ function SkeletonDashboard() {
 
 /* ── Settings Modal Component (proper Esc via useEffect) ── */
 function SettingsModal({ refData, setRefData, onClose }) {
+  // 編輯中保留原始字串（可清空、可輸入小數點），失焦或關閉時才寫回數字。
+  // 原本 onChange 直接 Number(v)||0：欄位一清空立刻變 0、小數點會被吃掉。
+  const [draft, setDraft] = useState({
+    lastMonthValue: String(refData.lastMonthValue ?? ""),
+    startYearValue: String(refData.startYearValue ?? ""),
+    usdToTwd: String(refData.usdToTwd ?? ""),
+  });
+  const commit = useCallback(() => {
+    setRefData((p) => {
+      const lm = Number(draft.lastMonthValue);
+      const sy = Number(draft.startYearValue);
+      const fx = Number(draft.usdToTwd);
+      return {
+        ...p,
+        lastMonthValue:
+          draft.lastMonthValue.trim() !== "" && Number.isFinite(lm) && lm >= 0
+            ? lm
+            : p.lastMonthValue,
+        startYearValue:
+          draft.startYearValue.trim() !== "" && Number.isFinite(sy) && sy >= 0
+            ? sy
+            : p.startYearValue,
+        // 匯率必須 > 0：0 會把所有美元資產換算成 0，空白或無效輸入一律保留原值
+        usdToTwd:
+          draft.usdToTwd.trim() !== "" && Number.isFinite(fx) && fx > 0
+            ? fx
+            : p.usdToTwd,
+      };
+    });
+  }, [draft, setRefData]);
+  const commitAndClose = useCallback(() => {
+    commit();
+    onClose();
+  }, [commit, onClose]);
   useEffect(() => {
     const h = (e) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") commitAndClose();
     };
     document.addEventListener("keydown", h);
     return () => document.removeEventListener("keydown", h);
-  }, [onClose]);
+  }, [commitAndClose]);
   return (
     <div
       className="modal-overlay"
@@ -5204,7 +5272,7 @@ function SettingsModal({ refData, setRefData, onClose }) {
       aria-modal="true"
       aria-label="基準與匯率設定"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) commitAndClose();
       }}
     >
       <div className="modal" style={{ maxWidth: 440, textAlign: "left" }}>
@@ -5217,13 +5285,11 @@ function SettingsModal({ refData, setRefData, onClose }) {
           <input
             className="form-input"
             type="number"
-            value={refData.lastMonthValue}
+            value={draft.lastMonthValue}
             onChange={(e) =>
-              setRefData((p) => ({
-                ...p,
-                lastMonthValue: Number(e.target.value) || 0,
-              }))
+              setDraft((p) => ({ ...p, lastMonthValue: e.target.value }))
             }
+            onBlur={commit}
           />
           <div
             style={{
@@ -5242,13 +5308,11 @@ function SettingsModal({ refData, setRefData, onClose }) {
           <input
             className="form-input"
             type="number"
-            value={refData.startYearValue}
+            value={draft.startYearValue}
             onChange={(e) =>
-              setRefData((p) => ({
-                ...p,
-                startYearValue: Number(e.target.value) || 0,
-              }))
+              setDraft((p) => ({ ...p, startYearValue: e.target.value }))
             }
+            onBlur={commit}
           />
         </div>
         <div className="form-group">
@@ -5257,17 +5321,15 @@ function SettingsModal({ refData, setRefData, onClose }) {
             className="form-input"
             type="number"
             step="0.01"
-            value={refData.usdToTwd}
+            value={draft.usdToTwd}
             onChange={(e) =>
-              setRefData((p) => ({
-                ...p,
-                usdToTwd: Number(e.target.value) || 0,
-              }))
+              setDraft((p) => ({ ...p, usdToTwd: e.target.value }))
             }
+            onBlur={commit}
           />
         </div>
         <div className="settings-actions">
-          <button className="settings-done" autoFocus onClick={onClose}>
+          <button className="settings-done" autoFocus onClick={commitAndClose}>
             完成設定
           </button>
         </div>
@@ -5277,7 +5339,11 @@ function SettingsModal({ refData, setRefData, onClose }) {
 }
 
 function AssetWarroomTab({ isDark, privacy }) {
-  const initialData = loadFromLocalStorage();
+  // 只在首次 render 解析 localStorage（原本每次 render 都重新 JSON.parse 整份資料）
+  const initialDataRef = useRef(null);
+  if (initialDataRef.current === null)
+    initialDataRef.current = loadFromLocalStorage();
+  const initialData = initialDataRef.current;
 
   const [assets, setAssets] = useState(initialData.assets);
   const [refData, setRefData] = useState(initialData.refData);
@@ -5292,6 +5358,7 @@ function AssetWarroomTab({ isDark, privacy }) {
   const [fxStatus, setFxStatus] = useState(null);
   const [fxUpdatedAt, setFxUpdatedAt] = useState(null);
   const [fxSuggestion, setFxSuggestion] = useState(null);
+  const [fxDraft, setFxDraft] = useState(null); // 匯率輸入編輯中的原始字串；null＝未編輯，顯示 refData 值
   const [hydrationTimedOut, setHydrationTimedOut] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const closeSettings = useCallback(() => setShowSettings(false), []);
@@ -5509,12 +5576,16 @@ function AssetWarroomTab({ isDark, privacy }) {
       isInitialLoad.current = false;
       return;
     }
+    // localStorage 立即寫入：宿主的「JSON 完整備份」直接讀這份，
+    // 不能有 debounce 空窗（原本延遲 500ms 才寫，備份可能拿到慢半拍的資料）；雲端寫入才防抖
+    const pureData = buildCloudPureData();
+    const pureJson = JSON.stringify(pureData);
+    try {
+      localStorage.setItem(AW_STORAGE_KEY, pureJson);
+    } catch {}
     setSaveStatus("saving");
     const timer = setTimeout(async () => {
       try {
-        const pureData = buildCloudPureData();
-        const pureJson = JSON.stringify(pureData);
-        localStorage.setItem(AW_STORAGE_KEY, pureJson);
         if (skipNextCloudSaveRef.current) {
           skipNextCloudSaveRef.current = false;
           lastSyncedJsonRef.current = pureJson;
@@ -6811,14 +6882,22 @@ function AssetWarroomTab({ isDark, privacy }) {
                           <input
                             type="number"
                             step="0.01"
-                            value={refData.usdToTwd}
+                            value={fxDraft ?? String(refData.usdToTwd)}
                             aria-label="美元匯率 USD/TWD"
-                            onChange={(e) =>
-                              setRefData((p) => ({
-                                ...p,
-                                usdToTwd: Number(e.target.value) || 0,
-                              }))
-                            }
+                            onChange={(e) => {
+                              // 編輯中顯示原始字串（可清空、打小數點不被吃字）；
+                              // 有效正數即時套用，維持原本邊打邊算的行為
+                              const raw = e.target.value;
+                              setFxDraft(raw);
+                              const n = Number(raw);
+                              if (
+                                raw.trim() !== "" &&
+                                Number.isFinite(n) &&
+                                n > 0
+                              )
+                                setRefData((p) => ({ ...p, usdToTwd: n }));
+                            }}
+                            onBlur={() => setFxDraft(null)}
                           />
                         </div>
                         <button
