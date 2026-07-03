@@ -899,10 +899,26 @@ function getScenarioStats(pd) {
     rets.reduce((s, r) => s + (r - avg) ** 2, 0) / (rets.length || 1)
   );
   const avgIn = l12.reduce((a, r) => a + r.netCashFlow, 0) / (l12.length || 1);
+  // 投入年增率自動推估：近 12 個月 vs 再前 12 個月的平均投入相比。
+  // 需至少 24 個月資料；限制 0~10%、負值歸 0（一次性提領或大額投入會污染長期外推，
+  // 手動滑桿永遠優先——調薪幅度是使用者自己最清楚的資訊）
+  let inflowGrowth = 0;
+  let inflowGrowthEstimated = false;
+  if (pd.length >= 24) {
+    const prev12 = pd.slice(-24, -12);
+    const prevAvg =
+      prev12.reduce((a, r) => a + Number(r.netCashFlow || 0), 0) / 12;
+    if (prevAvg > 0 && avgIn > 0) {
+      inflowGrowth = Math.min(10, Math.max(0, (avgIn / prevAvg - 1) * 100));
+      inflowGrowthEstimated = true;
+    }
+  }
   return {
     avgReturn: avg * 100,
     sigma: std * 100,
     avgInflow: avgIn,
+    inflowGrowth,
+    inflowGrowthEstimated,
     sampleMonths: basis.length,
     excludedMonths: l12.length - basis.length,
   };
@@ -917,16 +933,17 @@ function projectScenarios(
   customRate = null,
   customInflow = null,
   customSigma = null,
-  inflowGrowthPct = 0
+  inflowGrowthPct = null
 ) {
   const st = getScenarioStats(pd);
   const mean = customRate !== null ? customRate / 100 : st.avgReturn / 100;
   const sigma = customSigma !== null ? customSigma / 100 : st.sigma / 100;
   const inflow = customInflow !== null ? customInflow : st.avgInflow;
+  const growth = inflowGrowthPct !== null ? inflowGrowthPct : st.inflowGrowth;
   // 投入年增率：第 i 個月的投入＝基準投入 × (1+g)^(經過年數)，模擬薪資成長
   const inflows = [];
   for (let i = 1; i <= months; i++)
-    inflows.push(inflow * Math.pow(1 + inflowGrowthPct / 100, (i - 1) / 12));
+    inflows.push(inflow * Math.pow(1 + growth / 100, (i - 1) / 12));
   const N = 500;
   const rng = mulberry32(20260702);
   const randn = makeRandn(rng);
@@ -1032,8 +1049,8 @@ export default function App() {
   const [scenarioInflow, setScenarioInflow] = useState(null);
   // σ 滑桿：近 12 個月若剛好平靜，自動 σ 會太窄給假信心，可手動放大測壓力情境
   const [scenarioSigma, setScenarioSigma] = useState(null);
-  // 投入年增率：月投入隨年資成長（薪資調升），0 = 維持固定投入
-  const [scenarioInflowGrowth, setScenarioInflowGrowth] = useState(0);
+  // 投入年增率：null＝自動（前後 12 月投入推估，需 24 個月資料、限 0~10%），可手動覆寫
+  const [scenarioInflowGrowth, setScenarioInflowGrowth] = useState(null);
   // 滑桿顯示用即時值；Monte Carlo 吃 150ms 防抖值，拖曳時不會每個 tick 重跑 500 條路徑
   const debScenarioRate = useDebouncedValue(scenarioRate, 150);
   const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
@@ -3871,9 +3888,37 @@ export default function App() {
                 ｜月報酬 μ {scenarioDefaults.avgReturn.toFixed(1)}%・σ{" "}
                 {scenarioDefaults.sigma.toFixed(1)}%｜月均投入{" "}
                 {mask(`NT$ ${fmtN(Math.round(scenarioDefaults.avgInflow))}`)}
+                ・年增{" "}
+                {scenarioDefaults.inflowGrowthEstimated
+                  ? `${scenarioDefaults.inflowGrowth.toFixed(1)}%`
+                  : "0%（資料未滿 24 個月）"}
                 ｜樂觀＝P90、保守＝P10（非固定報酬率外推）
               </span>
             </div>
+            {scenarioMonths >= 60 && fireMuWarn && (
+              <div
+                className="alert alert-warn si si-1"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span style={{ flex: 1 }}>
+                  目前 μ {fireMuWarn.mu.toFixed(1)}%（年化約{" "}
+                  {fireMuWarn.annual.toFixed(0)}%）拉到 {scenarioMonths / 12}{" "}
+                  年外推會過度樂觀，建議改用長期合理值。
+                </span>
+                <button
+                  className="btn-ghost"
+                  style={{ padding: "6px 12px", fontSize: 12, flexShrink: 0 }}
+                  onClick={() => setScenarioRate(0.6)}
+                >
+                  套用長期建議值 0.6%
+                </button>
+              </div>
+            )}
             <div className="scenario-controls si si-1">
               <div className="slider-group">
                 <label className="slider-label">
@@ -3990,10 +4035,16 @@ export default function App() {
                   <SlidersHorizontal size={13} />
                   投入年增率{" "}
                   <span className="mono slider-val">
-                    {scenarioInflowGrowth === 0 ? (
+                    {scenarioInflowGrowth === null ? (
                       <>
-                        0%{" "}
-                        <span className="slider-auto-hint">（固定投入）</span>
+                        自動{" "}
+                        <span className="slider-auto-hint">
+                          (
+                          {scenarioDefaults.inflowGrowthEstimated
+                            ? `${scenarioDefaults.inflowGrowth.toFixed(1)}%`
+                            : "0%・資料未滿 24 個月"}
+                          )
+                        </span>
                       </>
                     ) : (
                       `${scenarioInflowGrowth.toFixed(1)}%／年`
@@ -4007,15 +4058,15 @@ export default function App() {
                   max={10}
                   step={0.5}
                   aria-label="投入年增率（%，模擬薪資成長）"
-                  value={scenarioInflowGrowth}
+                  value={scenarioInflowGrowth ?? scenarioDefaults.inflowGrowth}
                   onChange={(e) =>
                     setScenarioInflowGrowth(Number(e.target.value))
                   }
                 />
-                {scenarioInflowGrowth !== 0 && (
+                {scenarioInflowGrowth !== null && (
                   <button
                     className="btn-reset-sm"
-                    onClick={() => setScenarioInflowGrowth(0)}
+                    onClick={() => setScenarioInflowGrowth(null)}
                   >
                     重置
                   </button>
@@ -4258,11 +4309,27 @@ export default function App() {
               </div>
             </div>
             {fireStats && fireMuWarn && (
-              <div className="alert alert-warn">
-                模擬使用的月報酬 μ {fireMuWarn.mu.toFixed(1)}%（年化約{" "}
-                {fireMuWarn.annual.toFixed(0)}
-                %）高於長期市場合理水準，長期外推會過度樂觀。建議用上方「月均報酬假設」滑桿降到
-                0.4～0.6% 再看達成時間。
+              <div
+                className="alert alert-warn"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span style={{ flex: 1 }}>
+                  模擬使用的月報酬 μ {fireMuWarn.mu.toFixed(1)}%（年化約{" "}
+                  {fireMuWarn.annual.toFixed(0)}
+                  %）高於長期市場合理水準，長期外推會過度樂觀。
+                </span>
+                <button
+                  className="btn-ghost"
+                  style={{ padding: "6px 12px", fontSize: 12, flexShrink: 0 }}
+                  onClick={() => setScenarioRate(0.6)}
+                >
+                  套用長期建議值 0.6%
+                </button>
               </div>
             )}
             <div className="fire-grid">
