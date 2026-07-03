@@ -169,6 +169,11 @@ const THEMES = {
 };
 /* 當前主題（module-level，由 App 在 render 前更新） */
 let T = THEMES.dark;
+/* 尊重系統「減少動態效果」設定：數字動畫直接跳到目標值、捲動不用 smooth */
+const REDUCED_MOTION =
+  typeof window !== "undefined" &&
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 /* ─── Animated Number ─── */
 function useAnimNum(target, dur = 600) {
   const [d, setD] = useState(target);
@@ -180,6 +185,11 @@ function useAnimNum(target, dur = 600) {
     const from = shown.current,
       to = target;
     if (from === to) return;
+    if (REDUCED_MOTION) {
+      shown.current = to;
+      setD(to);
+      return;
+    }
     const st = performance.now();
     const tick = (now) => {
       const p = Math.min((now - st) / dur, 1);
@@ -836,6 +846,18 @@ function getFirebaseServices() {
   if (!_fbDb) _fbDb = getFirestore(_fbApp);
   return { app: _fbApp, auth: _fbAuth, db: _fbDb };
 }
+/* 匿名登入去重：主 App 與資產配置分頁各自監聽 auth，user 為 null 時
+   兩邊會同時要求登入，這裡共用同一個 Promise 避免重複發出匿名登入請求 */
+let _anonSignInPromise = null;
+function ensureAnonSignIn(auth) {
+  if (!_anonSignInPromise) {
+    _anonSignInPromise = signInAnonymously(auth).catch((e) => {
+      _anonSignInPromise = null;
+      throw e;
+    });
+  }
+  return _anonSignInPromise;
+}
 /* 種子隨機數產生器：同樣輸入永遠產生同樣路徑，拉滑桿時區間不會亂跳 */
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -950,8 +972,25 @@ export default function App() {
   // lazy initializer：localStorage 只在首次 render 解析一次
   //（原本每次 render 都跑 safeLoadLocal()，表單每打一個字就重新 JSON.parse 整份紀錄）
   const [records, setRecords] = useState(() => safeLoadLocal().records);
-  const [chartType, setChartType] = useState("return");
-  const [trendRange, setTrendRange] = useState("12");
+  // 檢視狀態記憶：圖表類型／區間／分頁 重新整理後維持上次狀態
+  const [chartType, setChartType] = useState(() => {
+    try {
+      const v = localStorage.getItem("agwr_chart");
+      return ["return", "assets", "invested", "composite", "twr"].includes(v)
+        ? v
+        : "return";
+    } catch {
+      return "return";
+    }
+  });
+  const [trendRange, setTrendRange] = useState(() => {
+    try {
+      const v = localStorage.getItem("agwr_range");
+      return ["12", "24", "ALL"].includes(v) ? v : "12";
+    } catch {
+      return "12";
+    }
+  });
   const [filterYear, setFilterYear] = useState("ALL");
   const [search, setSearch] = useState("");
   const [saveStatus, setSaveStatus] = useState("已載入");
@@ -965,7 +1004,18 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [cloudUid, setCloudUid] = useState("");
   const [showForm, setShowForm] = useState(false);
-  const [activeTab, setActiveTab] = useState("overview");
+  const [activeTab, setActiveTab] = useState(() => {
+    try {
+      const t = localStorage.getItem("agwr_tab");
+      return ["overview", "analysis", "records", "scenario", "allocation"].includes(
+        t
+      )
+        ? t
+        : "overview";
+    } catch {
+      return "overview";
+    }
+  });
   const [scenarioMonths, setScenarioMonths] = useState(24);
   const [sortCol, setSortCol] = useState("month");
   const [sortDir, setSortDir] = useState("desc");
@@ -974,14 +1024,18 @@ export default function App() {
   // 滑桿顯示用即時值；Monte Carlo 吃 150ms 防抖值，拖曳時不會每個 tick 重跑 500 條路徑
   const debScenarioRate = useDebouncedValue(scenarioRate, 150);
   const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
-  const [animTab, setAnimTab] = useState("overview");
-  const visitedTabsRef = useRef({ overview: true });
+  const [animTab, setAnimTab] = useState(activeTab);
+  const visitedTabsRef = useRef(null);
+  if (visitedTabsRef.current === null)
+    visitedTabsRef.current = { [activeTab]: true };
   const [showDataModal, setShowDataModal] = useState(false);
   const csvInputRef = useRef(null);
   const jsonInputRef = useRef(null);
   const [fireInput, setFireInput] = useState("");
   const [fireExpense, setFireExpense] = useState(0);
   const [hoveredMonth, setHoveredMonth] = useState(null);
+  // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
+  const [hmSel, setHmSel] = useState(null);
   const [isDark, setIsDark] = useState(() => {
     try {
       return localStorage.getItem("agwr_theme") !== "light";
@@ -994,6 +1048,12 @@ export default function App() {
       localStorage.setItem("agwr_theme", isDark ? "dark" : "light");
     } catch {}
   }, [isDark]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("agwr_chart", chartType);
+      localStorage.setItem("agwr_range", trendRange);
+    } catch {}
+  }, [chartType, trendRange]);
   // 隱私模式：一鍵隱藏所有金額
   const [privacy, setPrivacy] = useState(() => {
     try {
@@ -1009,8 +1069,8 @@ export default function App() {
   }, [privacy]);
   // 自訂確認視窗與刪除復原（取代 window.confirm）
   const [confirmDlg, setConfirmDlg] = useState(null);
-  const [undoDel, setUndoDel] = useState(null);
-  const undoTimerRef = useRef(null);
+  // 刪除復原改多筆堆疊：連刪多筆各自都能在 6 秒內復原（原本單槽會被後一筆蓋掉）
+  const [undoDels, setUndoDels] = useState([]);
   // Sync module-level T before render
   T = isDark ? THEMES.dark : THEMES.light;
   const css = useMemo(() => makeCSS(T), [isDark]);
@@ -1070,7 +1130,7 @@ export default function App() {
         try {
           if (!user) {
             setCloudState("登入中...");
-            await signInAnonymously(auth);
+            await ensureAnonSignIn(auth);
             return;
           }
           if (!mt) return;
@@ -1438,6 +1498,8 @@ export default function App() {
     if (!formData.totalAssets || Number(formData.totalAssets) <= 0)
       e.push("總資產>0");
     if (Number(formData.cashAssets || 0) < 0) e.push("現金≥0");
+    if (Number(formData.netIn || 0) < 0) e.push("淨投入≥0");
+    if (Number(formData.netOut || 0) < 0) e.push("淨提領≥0");
     if (Number(formData.liabilities || 0) < 0) e.push("負債≥0");
     if (
       Number(formData.cashAssets || 0) + Number(formData.otherAssets || 0) >
@@ -1524,6 +1586,10 @@ export default function App() {
     if (!hoveredMonth) return null;
     return pd.find((r) => r.month === hoveredMonth) || null;
   }, [hoveredMonth, pd]);
+  const hmSelData = useMemo(
+    () => (hmSel ? pd.find((r) => r.month === hmSel) || null : null),
+    [hmSel, pd]
+  );
 
   const applySave = (c, existed) => {
     setRecords((p) =>
@@ -1553,7 +1619,33 @@ export default function App() {
       note: formData.note || "",
     };
     const ex = records.some((r) => r.month === c.month);
-    if (ex && editingMonth !== c.month) {
+    // 編輯中改了月份：明確詢問「移動」或「另存」。
+    // 原本會默默新增一筆、舊月份紀錄還留著，使用者以為是搬移，結果多出重複資料
+    if (editingMonth && editingMonth !== c.month) {
+      setConfirmDlg({
+        title: "月份已變更",
+        message: `正在編輯 ${editingMonth}，月份已改為 ${c.month}。「移動」會刪除 ${editingMonth} 的原紀錄${
+          ex ? `並覆蓋 ${c.month} 現有資料` : ""
+        }；「另存」則保留原紀錄、另外新增一筆。`,
+        confirmLabel: "移動",
+        secondaryLabel: "另存",
+        onConfirm: () => {
+          setRecords((p) =>
+            normalizeRecords([
+              ...p.filter(
+                (r) => r.month !== editingMonth && r.month !== c.month
+              ),
+              c,
+            ])
+          );
+          setEditingMonth(c.month);
+          setToast(`已移動至 ${c.month}`);
+        },
+        onSecondary: () => applySave(c, ex),
+      });
+      return;
+    }
+    if (ex && !editingMonth) {
       setConfirmDlg({
         title: "覆蓋紀錄",
         message: `${c.month} 已有資料，確定要覆蓋嗎？原數值將被取代。`,
@@ -1607,19 +1699,21 @@ export default function App() {
         setRecords((p) => normalizeRecords(p.filter((r) => r.month !== m)));
         if (editingMonth === m) resetForm();
         if (rec) {
-          setUndoDel({ record: rec });
-          if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-          undoTimerRef.current = setTimeout(() => setUndoDel(null), 6000);
+          const uid = generateId();
+          setUndoDels((p) => [...p, { id: uid, record: rec }]);
+          setTimeout(() => {
+            setUndoDels((p) => p.filter((u) => u.id !== uid));
+          }, 6000);
         }
       },
     });
   };
-  const handleUndoDel = () => {
-    if (!undoDel) return;
-    setRecords((p) => normalizeRecords([...p, undoDel.record]));
-    setUndoDel(null);
-    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-    setToast("已復原");
+  const handleUndoDel = (uid) => {
+    const t = undoDels.find((u) => u.id === uid);
+    if (!t) return;
+    setRecords((p) => normalizeRecords([...p, t.record]));
+    setUndoDels((p) => p.filter((u) => u.id !== uid));
+    setToast(`已復原 ${t.record.month}`);
   };
   // ── 匯入／備份／還原 ──
   const handleImportCSV = (file) => {
@@ -1754,7 +1848,7 @@ export default function App() {
       note: row.note || "",
     });
     setShowForm(true);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({ top: 0, behavior: REDUCED_MOTION ? "auto" : "smooth" });
   };
   const resetForm = () => {
     setEditingMonth("");
@@ -1803,8 +1897,8 @@ export default function App() {
       }));
       setToast(
         privacy
-          ? "已帶入資產配置數值"
-          : `已帶入：總資產 ${fmtN(total)}／現金 ${fmtN(cash)}`
+          ? "已帶入資產配置數值（現金＝「現金」類合計）"
+          : `已帶入：總資產 ${fmtN(total)}／現金 ${fmtN(cash)}（現金＝「現金」類合計）`
       );
     } catch {
       setToast("帶入失敗");
@@ -1819,6 +1913,9 @@ export default function App() {
   };
   // 只有第一次進入某個 tab 才播進場動畫，之後切換直接顯示
   const switchTab = (t) => {
+    try {
+      localStorage.setItem("agwr_tab", t);
+    } catch {}
     if (!visitedTabsRef.current[t]) {
       visitedTabsRef.current[t] = true;
       setAnimTab(t);
@@ -1849,37 +1946,44 @@ export default function App() {
   return (
     <div className="app-root">
       <style>{css}</style>
-      {toast && (
-        <div className="toast">
-          {toast}
-          <button
-            className="toast-close"
-            onClick={() => setToast("")}
-            aria-label="關閉通知"
-          >
-            <X size={12} />
-          </button>
-        </div>
-      )}
-      {undoDel && (
-        <div className="toast" style={{ top: toast ? 72 : 20 }}>
-          已刪除 {undoDel.record.month}
-          <button className="btn-undo" onClick={handleUndoDel}>
-            復原
-          </button>
-          <button
-            className="toast-close"
-            onClick={() => setUndoDel(null)}
-            aria-label="關閉"
-          >
-            <X size={12} />
-          </button>
-        </div>
-      )}
+      <div className="toast-host">
+        {toast && (
+          <div className="toast">
+            {toast}
+            <button
+              className="toast-close"
+              onClick={() => setToast("")}
+              aria-label="關閉通知"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        )}
+        {undoDels.map((u) => (
+          <div className="toast" key={u.id}>
+            已刪除 {u.record.month}
+            <button className="btn-undo" onClick={() => handleUndoDel(u.id)}>
+              復原
+            </button>
+            <button
+              className="toast-close"
+              onClick={() =>
+                setUndoDels((p) => p.filter((x) => x.id !== u.id))
+              }
+              aria-label="關閉"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
       {confirmDlg && (
         <ConfirmModal
           title={confirmDlg.title}
           message={confirmDlg.message}
+          confirmLabel={confirmDlg.confirmLabel}
+          secondaryLabel={confirmDlg.secondaryLabel}
+          onSecondary={confirmDlg.onSecondary}
           onConfirm={confirmDlg.onConfirm}
           onCancel={() => setConfirmDlg(null)}
         />
@@ -2057,6 +2161,7 @@ export default function App() {
         ))}
       </nav>
 
+      <ErrorBoundary resetKey={activeTab}>
       {showForm && (
         <section className="card form-card stagger-in" key="form">
           <div className="form-header">
@@ -2073,7 +2178,7 @@ export default function App() {
               <button
                 className="btn-ghost"
                 onClick={importFromAllocation}
-                title="讀取「資產配置」分頁目前的總資產與現金"
+                title="讀取「資產配置」分頁目前的總資產與現金（現金＝「現金」類合計）"
               >
                 <Wallet size={14} />
                 從資產配置帶入
@@ -2091,7 +2196,20 @@ export default function App() {
               距上次 {gapWarning} 個月（{latest?.month}），是否漏填？
             </div>
           )}
-          <div className="form-body">
+          <div
+            className="form-body"
+            onKeyDown={(e) => {
+              // Enter 直接送出（備註等單行輸入皆適用），每月記帳不必移滑鼠按儲存
+              if (
+                e.key === "Enter" &&
+                e.target.tagName === "INPUT" &&
+                !e.nativeEvent.isComposing
+              ) {
+                e.preventDefault();
+                handleSave();
+              }
+            }}
+          >
             <div className="form-fields">
               <FF
                 label="年月"
@@ -2218,7 +2336,10 @@ export default function App() {
                 onClick={() => {
                   resetForm();
                   setShowForm(true);
-                  window.scrollTo({ top: 0, behavior: "smooth" });
+                  window.scrollTo({
+                    top: 0,
+                    behavior: REDUCED_MOTION ? "auto" : "smooth",
+                  });
                 }}
               >
                 立即補登
@@ -2476,14 +2597,14 @@ export default function App() {
               </h3>
               <div className="goal-input-wrap">
                 <span className="goal-prefix mono">NT$</span>
-                <input
-                  className="goal-input mono"
-                  type="number"
-                  placeholder="目標金額"
+                <MaskedNumInput
+                  privacy={privacy}
                   value={goalInput}
-                  onChange={(e) => {
-                    setGoalInput(e.target.value);
-                    setGoalValue(Number(e.target.value) || 0);
+                  placeholder="目標金額"
+                  ariaLabel="目標金額"
+                  onChange={(v) => {
+                    setGoalInput(v);
+                    setGoalValue(Number(v) || 0);
                   }}
                 />
               </div>
@@ -3212,7 +3333,7 @@ export default function App() {
               月報酬熱力圖
             </h3>
             <p className="card-desc">
-              綠＝正報酬、紅＝負報酬，越深幅度越大；斜線＝該月未更新總資產
+              綠＝正報酬、紅＝負報酬，越深幅度越大；斜線＝該月未更新總資產。點擊任一格查看明細。
             </p>
             <div className="heatmap-wrap">
               <div className="heatmap-grid">
@@ -3242,7 +3363,12 @@ export default function App() {
                       return (
                         <div
                           key={`${y.year}-${i}`}
-                          className={`hm-cell mono ${flat ? "hm-flat" : ""}`}
+                          className={`hm-cell mono ${flat ? "hm-flat" : ""} ${
+                            hmSel === r.month ? "hm-selected" : ""
+                          }`}
+                          onClick={() =>
+                            setHmSel((s) => (s === r.month ? null : r.month))
+                          }
                           style={
                             flat
                               ? undefined
@@ -3272,6 +3398,59 @@ export default function App() {
                 ))}
               </div>
             </div>
+            {hmSelData && (
+              <div className="hover-kpi-strip" style={{ marginTop: 12 }}>
+                <span className="hover-kpi-label mono">{hmSelData.month}</span>
+                <span className="hover-kpi-item">
+                  報酬{" "}
+                  <b
+                    className="mono"
+                    style={{
+                      color:
+                        hmSelData.returnRate >= 0 ? T.positive : T.negative,
+                    }}
+                  >
+                    {fmtP(hmSelData.returnRate)}
+                  </b>
+                </span>
+                <span className="hover-kpi-item">
+                  總資產{" "}
+                  <b className="mono">{mask(fmtS(hmSelData.totalAssets))}</b>
+                </span>
+                <span className="hover-kpi-item">
+                  淨增值{" "}
+                  <b
+                    className="mono"
+                    style={{
+                      color: hmSelData.netGain >= 0 ? T.positive : T.negative,
+                    }}
+                  >
+                    {mask(fmtS(hmSelData.netGain))}
+                  </b>
+                </span>
+                <span className="hover-kpi-item">
+                  現金 <b className="mono">{mask(fmtS(hmSelData.cashAssets))}</b>
+                </span>
+                {Number(hmSelData.prevAssets) !== 0 &&
+                  Number(hmSelData.totalAssets) ===
+                    Number(hmSelData.prevAssets) && (
+                    <span
+                      className="hover-kpi-item"
+                      style={{ color: T.textTertiary }}
+                    >
+                      （該月未更新）
+                    </span>
+                  )}
+                <button
+                  className="toast-close"
+                  onClick={() => setHmSel(null)}
+                  aria-label="關閉月份明細"
+                  style={{ marginLeft: "auto" }}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            )}
           </section>
         </div>
       )}
@@ -3456,6 +3635,99 @@ export default function App() {
                   )}
                 </tbody>
               </table>
+            </div>
+            {/* 手機版卡片視圖：≤768px 隱藏表格、改用卡片，與資產配置分頁行為一致 */}
+            <div className="rec-mobile-list">
+              {tableData.map((row) => (
+                <div className="rec-mobile-card" key={`m-${row.month}`}>
+                  <div className="rec-mobile-head">
+                    <span className="mono rec-mobile-month">{row.month}</span>
+                    <span
+                      className={`return-chip ${
+                        row.returnRate >= 0 ? "pos" : "neg"
+                      }`}
+                    >
+                      {fmtP(row.returnRate)}
+                    </span>
+                  </div>
+                  <div className="rec-mobile-grid">
+                    <div className="rec-mobile-field">
+                      <span className="rec-mobile-label">總資產</span>
+                      <span className="rec-mobile-value mono">
+                        {mask(fmtN(row.totalAssets))}
+                      </span>
+                    </div>
+                    <div className="rec-mobile-field">
+                      <span className="rec-mobile-label">投資</span>
+                      <span className="rec-mobile-value mono">
+                        {mask(fmtN(row.investedAssets))}
+                      </span>
+                    </div>
+                    <div className="rec-mobile-field">
+                      <span className="rec-mobile-label">現金</span>
+                      <span className="rec-mobile-value mono">
+                        {mask(fmtN(row.cashAssets))}
+                      </span>
+                    </div>
+                    <div className="rec-mobile-field">
+                      <span className="rec-mobile-label">淨投入</span>
+                      <span
+                        className="rec-mobile-value mono"
+                        style={{
+                          color: row.netIn > 0 ? T.positive : T.textTertiary,
+                        }}
+                      >
+                        {row.netIn > 0 ? mask(fmtN(row.netIn)) : "—"}
+                      </span>
+                    </div>
+                    <div className="rec-mobile-field">
+                      <span className="rec-mobile-label">淨提領</span>
+                      <span
+                        className="rec-mobile-value mono"
+                        style={{
+                          color: row.netOut > 0 ? T.negative : T.textTertiary,
+                        }}
+                      >
+                        {row.netOut > 0 ? mask(fmtN(row.netOut)) : "—"}
+                      </span>
+                    </div>
+                    {hasLiab && (
+                      <div className="rec-mobile-field">
+                        <span className="rec-mobile-label">負債</span>
+                        <span className="rec-mobile-value mono">
+                          {row.liabilities > 0
+                            ? mask(fmtN(row.liabilities))
+                            : "—"}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  {row.note && row.note !== "歷史資料導入" && (
+                    <div className="rec-mobile-note">{row.note}</div>
+                  )}
+                  <div className="rec-mobile-actions">
+                    <button
+                      className="icon-btn"
+                      onClick={() => handleEdit(row)}
+                      title="編輯"
+                      aria-label={`編輯 ${row.month}`}
+                    >
+                      <Pencil size={13} />
+                    </button>
+                    <button
+                      className="icon-btn"
+                      onClick={() => handleDel(row.month)}
+                      title="刪除"
+                      aria-label={`刪除 ${row.month}`}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {!tableData.length && (
+                <div className="empty-cell">查無資料</div>
+              )}
             </div>
           </section>
         </div>
@@ -3772,15 +4044,14 @@ export default function App() {
               <div>
                 <div className="goal-input-wrap">
                   <span className="goal-prefix mono">年支出 NT$</span>
-                  <input
-                    className="goal-input mono"
-                    type="number"
-                    placeholder="例如 600000"
-                    aria-label="年支出"
+                  <MaskedNumInput
+                    privacy={privacy}
                     value={fireInput}
-                    onChange={(e) => {
-                      setFireInput(e.target.value);
-                      setFireExpense(Number(e.target.value) || 0);
+                    placeholder="例如 600000"
+                    ariaLabel="年支出"
+                    onChange={(v) => {
+                      setFireInput(v);
+                      setFireExpense(Number(v) || 0);
                     }}
                   />
                 </div>
@@ -3870,15 +4141,104 @@ export default function App() {
           </section>
         </div>
       )}
+      </ErrorBoundary>
       {/* 資產配置分頁：常駐掛載（display 切換），Firebase 同步不中斷 */}
       <div style={{ display: activeTab === "allocation" ? "block" : "none" }}>
-        <AssetWarroomTab isDark={isDark} privacy={privacy} />
+        <ErrorBoundary>
+          <AssetWarroomTab
+            isDark={isDark}
+            privacy={privacy}
+            active={activeTab === "allocation"}
+          />
+        </ErrorBoundary>
       </div>
     </div>
   );
 }
 
 /* ═══════════ SUB-COMPONENTS ═══════════ */
+/* 錯誤邊界：單一區塊（圖表等）出錯時顯示重試卡片，避免整頁白屏；
+   resetKey 變動（切換分頁）時自動清除錯誤狀態重新渲染 */
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("[ErrorBoundary]", error, info);
+  }
+  componentDidUpdate(prevProps) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error)
+      this.setState({ error: null });
+  }
+  render() {
+    if (this.state.error)
+      return (
+        <div className="card" style={{ textAlign: "center", padding: 40 }}>
+          <AlertTriangle
+            size={28}
+            style={{ color: T.negative, marginBottom: 12 }}
+          />
+          <div style={{ fontWeight: 700, marginBottom: 6, color: T.text }}>
+            此區塊發生錯誤
+          </div>
+          <div
+            style={{ fontSize: 13, color: T.textSecondary, marginBottom: 16 }}
+          >
+            {String(
+              (this.state.error && this.state.error.message) ||
+                this.state.error
+            )}
+          </div>
+          <button
+            className="btn-ghost"
+            onClick={() => this.setState({ error: null })}
+            style={{ margin: "0 auto" }}
+          >
+            <RefreshCw size={14} />
+            重試
+          </button>
+        </div>
+      );
+    return this.props.children;
+  }
+}
+/* 隱私模式下可遮罩的數字輸入：有值時顯示＊＊＊＊＊，點擊暫時解鎖編輯、失焦恢復遮罩。
+   目標金額與 FIRE 年支出跟總資產一樣敏感，不能在隱私模式下裸奔 */
+function MaskedNumInput({ privacy, value, placeholder, ariaLabel, onChange }) {
+  const [reveal, setReveal] = useState(false);
+  useEffect(() => {
+    if (!privacy) setReveal(false);
+  }, [privacy]);
+  if (privacy && !reveal && value !== "" && value != null) {
+    return (
+      <button
+        type="button"
+        className="goal-input mono goal-masked"
+        onClick={() => setReveal(true)}
+        title="隱私模式中，點擊以編輯"
+        aria-label={`${ariaLabel}（已遮罩，點擊編輯）`}
+      >
+        ＊＊＊＊＊
+      </button>
+    );
+  }
+  return (
+    <input
+      className="goal-input mono"
+      type="number"
+      placeholder={placeholder}
+      aria-label={ariaLabel}
+      value={value}
+      autoFocus={privacy && reveal}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={() => setReveal(false)}
+    />
+  );
+}
 function FF({ label, type, value, onChange, big }) {
   return (
     <div className="form-field">
@@ -4081,7 +4441,15 @@ function ContribTip({ active, payload, label, privacy }) {
     </div>
   );
 }
-function ConfirmModal({ title, message, onConfirm, onCancel }) {
+function ConfirmModal({
+  title,
+  message,
+  onConfirm,
+  onCancel,
+  confirmLabel = "確認",
+  secondaryLabel,
+  onSecondary,
+}) {
   useEffect(() => {
     const h = (e) => {
       if (e.key === "Escape") onCancel();
@@ -4109,6 +4477,17 @@ function ConfirmModal({ title, message, onConfirm, onCancel }) {
           <button className="modal-cancel" onClick={onCancel}>
             取消
           </button>
+          {secondaryLabel && onSecondary && (
+            <button
+              className="modal-secondary"
+              onClick={() => {
+                onSecondary();
+                onCancel();
+              }}
+            >
+              {secondaryLabel}
+            </button>
+          )}
           <button
             className="modal-confirm"
             autoFocus
@@ -4117,7 +4496,7 @@ function ConfirmModal({ title, message, onConfirm, onCancel }) {
               onCancel();
             }}
           >
-            確認
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -4146,10 +4525,15 @@ table{border-collapse:collapse}
 .stagger-in{animation:staggerIn 0.4s ease-out}
 .tab-enter{animation:tabEnter 0.4s cubic-bezier(0.16,1,0.3,1)}
 
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important;scroll-behavior:auto!important}
+}
+
 .app-root{max-width:1400px;margin:0 auto;padding:24px 24px 80px}
 @media(max-width:768px){.app-root{padding:16px 16px 64px}}
 
-.toast{position:fixed;top:20px;right:20px;z-index:999;background:${T.surfaceAlt};color:${T.text};border:1px solid ${T.border};padding:12px 20px;border-radius:10px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;box-shadow:${T.shadow3};animation:staggerIn 0.3s ease-out}
+.toast-host{position:fixed;top:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast{pointer-events:auto;background:${T.surfaceAlt};color:${T.text};border:1px solid ${T.border};padding:12px 20px;border-radius:10px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;box-shadow:${T.shadow3};animation:staggerIn 0.3s ease-out}
 .toast-close{background:transparent;border:none;color:${T.textSecondary};cursor:pointer;display:flex;align-items:center;opacity:0.6;transition:opacity 0.15s}
 .toast-close:hover{opacity:1}
 
@@ -4232,6 +4616,8 @@ table{border-collapse:collapse}
 .goal-input-wrap:focus-within{border-color:${T.gold};box-shadow:0 0 0 3px ${T.goldLight}}
 .goal-prefix{padding:10px 14px;font-size:13px;font-weight:500;color:${T.textTertiary};background:${T.surfaceAlt};border-right:1px solid ${T.border}}
 .goal-input{flex:1;border:none;outline:none;padding:10px 14px;font-size:16px;font-weight:500;color:${T.text};background:transparent}
+.goal-masked{cursor:pointer;text-align:left;letter-spacing:0.1em;color:${T.textTertiary}}
+.goal-masked:hover{color:${T.textSecondary}}
 .goal-body{display:flex;flex-direction:column;gap:8px}
 .progress-track{height:5px;background:${T.surfaceInset};border-radius:999px;overflow:hidden}
 .progress-fill{height:100%;border-radius:999px;transition:width 0.6s cubic-bezier(0.16,1,0.3,1)}
@@ -4323,6 +4709,21 @@ table{border-collapse:collapse}
 .data-table tbody tr:nth-child(even) td{background:${T.surfaceInset}}
 .data-table tbody tr:nth-child(even):hover td{background:${T.surfaceHover}}
 
+.rec-mobile-list{display:none;flex-direction:column;gap:10px}
+.rec-mobile-card{background:${T.surfaceAlt};border:1px solid ${T.border};border-radius:12px;padding:14px}
+.rec-mobile-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.rec-mobile-month{font-weight:700;font-size:15px;color:${T.text}}
+.rec-mobile-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+.rec-mobile-field{display:flex;flex-direction:column;gap:2px}
+.rec-mobile-label{font-size:10px;color:${T.textTertiary};font-weight:700;letter-spacing:0.05em;text-transform:uppercase}
+.rec-mobile-value{font-size:13px;font-weight:600;color:${T.text}}
+.rec-mobile-note{margin-top:10px;font-size:12px;color:${T.textTertiary};line-height:1.5}
+.rec-mobile-actions{display:flex;gap:6px;justify-content:flex-end;margin-top:10px;padding-top:10px;border-top:1px solid ${T.border}}
+@media(max-width:768px){
+  .table-scroll{display:none}
+  .rec-mobile-list{display:flex}
+}
+
 .scenario-controls{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:16px;padding:20px;background:${T.surfaceInset};border-radius:12px;border:1px solid ${T.border}}
 @media(max-width:768px){.scenario-controls{grid-template-columns:1fr}}
 .slider-group{display:flex;flex-direction:column;gap:8px}
@@ -4367,6 +4768,8 @@ table{border-collapse:collapse}
 .modal-actions button{flex:1;height:42px;border-radius:9px;border:none;cursor:pointer;font-size:13px;font-weight:700;transition:all 0.15s}
 .modal-cancel{background:${T.surfaceAlt};color:${T.textSecondary};border:1px solid ${T.border}}
 .modal-cancel:hover{color:${T.text}}
+.modal-secondary{background:${T.goldLight};color:${T.gold};border:1px solid ${T.borderAccent}}
+.modal-secondary:hover{filter:brightness(1.1)}
 .modal-confirm{background:${T.negative};color:#fff}
 .modal-confirm:hover{box-shadow:0 4px 14px rgba(0,0,0,0.25)}
 
@@ -4391,6 +4794,8 @@ table{border-collapse:collapse}
 .hm-head{font-size:10px;color:${T.textTertiary};text-align:center;font-weight:600;padding:2px 0}
 .hm-year{font-size:11px;color:${T.textSecondary};font-weight:600;display:flex;align-items:center}
 .hm-cell{height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;border:1px solid ${T.border};color:${T.text}}
+.hm-cell:not(.hm-empty){cursor:pointer}
+.hm-cell.hm-selected{outline:2px solid ${T.gold};outline-offset:1px}
 .hm-empty{border-style:dashed;opacity:0.35}
 .hm-flat{color:${T.textTertiary};background:repeating-linear-gradient(45deg,transparent,transparent 4px,${T.border} 4px,${T.border} 5px)}
 
@@ -4698,6 +5103,11 @@ button,input,select{font:inherit;}
 .delay-4{animation-delay:0.2s;} .delay-5{animation-delay:0.25s;} .delay-6{animation-delay:0.3s;} .delay-7{animation-delay:0.35s;}
 .spin{animation:spin 1s linear infinite;}
 
+@media (prefers-reduced-motion: reduce){
+  .awr *,.awr *::before,.awr *::after{animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important;}
+  .awr .animate-in{opacity:1;}
+}
+
 .app{padding-bottom:32px;color:var(--c-text);font-family:var(--font);}
 .shell{max-width:100%;margin:0;padding:0;}
 
@@ -4986,6 +5396,7 @@ button,input,select{font:inherit;}
 .t-up{transform:none;} .t-down{transform:rotate(180deg);}
 
 .mobile-add-sheet{display:none;}
+#mobile-add-trigger{display:none;}
 .mobile-add-sheet-overlay{display:none;position:fixed;inset:0;z-index:140;background:var(--c-modal-overlay);backdrop-filter:blur(4px);}
 .mobile-add-sheet-overlay.open{display:block;}
 
@@ -5395,7 +5806,7 @@ function SettingsModal({ refData, setRefData, onClose }) {
   );
 }
 
-function AssetWarroomTab({ isDark, privacy }) {
+function AssetWarroomTab({ isDark, privacy, active }) {
   // 只在首次 render 解析 localStorage（原本每次 render 都重新 JSON.parse 整份資料）
   const initialDataRef = useRef(null);
   if (initialDataRef.current === null)
@@ -5457,6 +5868,19 @@ function AssetWarroomTab({ isDark, privacy }) {
       return false;
     }
   });
+  // 本月尚未快照提醒：自動快照只在每月 1 號開啟頁面才觸發，錯過就靠這條補
+  const currentMonthKey = getMonthKey(new Date());
+  const hasThisMonthSnap = useMemo(
+    () => snapshots.some((s) => s.monthKey === currentMonthKey),
+    [snapshots, currentMonthKey]
+  );
+  const [snapNudgeDismissedKey, setSnapNudgeDismissedKey] = useState(() => {
+    try {
+      return localStorage.getItem("asset_warroom_snap_nudge") || "";
+    } catch {
+      return "";
+    }
+  });
   const [showMobileAdd, setShowMobileAdd] = useState(false);
   useEffect(() => {
     if (!showMobileAdd) return;
@@ -5467,6 +5891,15 @@ function AssetWarroomTab({ isDark, privacy }) {
     return () => document.removeEventListener("keydown", h);
   }, [showMobileAdd]);
   const [newAssetErrors, setNewAssetErrors] = useState({});
+  // 圖表重掛計數：本分頁常駐掛載在 display:none 容器裡，recharts 的
+  // ResponsiveContainer 在隱藏時量到 0×0 後不會自己恢復，每次切入分頁
+  // bump epoch 強制重掛圖表容器，讓它在可見狀態下重新量測
+  const [chartEpoch, setChartEpoch] = useState(0);
+  const prevActiveRef = useRef(active);
+  useEffect(() => {
+    if (active && !prevActiveRef.current) setChartEpoch((e) => e + 1);
+    prevActiveRef.current = active;
+  }, [active]);
 
 
   // 主題與隱私模式由宿主 App 以 props 傳入
@@ -5552,7 +5985,7 @@ function AssetWarroomTab({ isDark, privacy }) {
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
       try {
         if (!user) {
-          await signInAnonymously(auth);
+          await ensureAnonSignIn(auth);
           return;
         }
         const docRef = doc(db, AW_CLOUD_DOC.collection, AW_CLOUD_DOC.doc);
@@ -6736,6 +7169,48 @@ function AssetWarroomTab({ isDark, privacy }) {
                 </div>
               )}
 
+              {/* ── Snapshot Nudge Banner：本月尚未快照 ── */}
+              {!hasThisMonthSnap &&
+                snapNudgeDismissedKey !== currentMonthKey && (
+                  <div className="nudge-banner animate-in">
+                    <div className="nudge-icon">
+                      <Camera size={18} />
+                    </div>
+                    <div className="nudge-body">
+                      <div className="nudge-title">
+                        {currentMonthKey} 尚未建立快照
+                      </div>
+                      <div className="nudge-sub">
+                        自動快照只在每月 1
+                        號開啟頁面時觸發。建立本月快照後，月度變化與偏離度比較才會準確。
+                      </div>
+                    </div>
+                    <button
+                      className="btn"
+                      style={{ flexShrink: 0 }}
+                      onClick={createSnapshot}
+                    >
+                      <Camera size={14} />
+                      立即快照
+                    </button>
+                    <button
+                      className="nudge-dismiss"
+                      onClick={() => {
+                        setSnapNudgeDismissedKey(currentMonthKey);
+                        try {
+                          localStorage.setItem(
+                            "asset_warroom_snap_nudge",
+                            currentMonthKey
+                          );
+                        } catch {}
+                      }}
+                      aria-label="本月不再提醒"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                )}
+
               {/* ── Hero Card ── */}
               <div className="hero-card animate-in" style={{ marginTop: 16 }}>
                 <div className="hero-grid">
@@ -7193,7 +7668,7 @@ function AssetWarroomTab({ isDark, privacy }) {
                       <div className="aw-card-desc">
                         所有資產先換算成台幣後，檢視目前整體配置結構（不受搜尋篩選影響）。
                       </div>
-                      <div className="aw-chart-wrap">
+                      <div className="aw-chart-wrap" key={`pie-${chartEpoch}`}>
                         <ResponsiveContainer width="100%" height="100%">
                           <PieChart>
                             <Pie
@@ -7238,7 +7713,7 @@ function AssetWarroomTab({ isDark, privacy }) {
                                         fontSize="22"
                                         fill={pieCenterColor}
                                         fontWeight="700"
-                                        fontFamily="IBM Plex Mono,monospace"
+                                        fontFamily="DM Mono,monospace"
                                       >
                                         {maskMoney(formatCompact(totalValue))}
                                       </tspan>
@@ -7352,7 +7827,11 @@ function AssetWarroomTab({ isDark, privacy }) {
                       <div className="aw-card-desc">
                         比較各類別目前占比與目標占比的距離。
                       </div>
-                      <div className="aw-chart-wrap" style={{ height: 320 }}>
+                      <div
+                        className="aw-chart-wrap"
+                        style={{ height: 320 }}
+                        key={`bar-${chartEpoch}`}
+                      >
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart
                             data={barData}
@@ -7486,7 +7965,11 @@ function AssetWarroomTab({ isDark, privacy }) {
                           </button>
                         )}
                       </div>
-                      <div className="aw-chart-wrap" style={{ height: 320 }}>
+                      <div
+                        className="aw-chart-wrap"
+                        style={{ height: 320 }}
+                        key={`snap-${chartEpoch}`}
+                      >
                         {snapshotChartData.length > 0 ? (
                           <ResponsiveContainer width="100%" height="100%">
                             <LineChart
