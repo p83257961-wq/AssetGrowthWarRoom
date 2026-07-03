@@ -167,8 +167,8 @@ const THEMES = {
     shadow3: "0 0 0 1px rgba(28,28,30,0.08),0 8px 24px rgba(28,28,30,0.06)",
   },
 };
-/* 當前主題（module-level，由 App 在 render 前更新） */
-let T = THEMES.dark;
+/* 當前主題（module-level，由 App 在 render 前更新）；預設淺色 */
+let T = THEMES.light;
 /* 尊重系統「減少動態效果」設定：數字動畫直接跳到目標值、捲動不用 smooth */
 const REDUCED_MOTION =
   typeof window !== "undefined" &&
@@ -1068,16 +1068,18 @@ export default function App() {
   const [hoveredMonth, setHoveredMonth] = useState(null);
   // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
   const [hmSel, setHmSel] = useState(null);
+  // 預設淺色。key 升到 v2：舊 key 存的「dark」是初版自動寫入的預設值而非使用者選擇，
+  // 沿用會讓改預設對既有裝置無效；v2 之後只記錄使用者實際切換的結果
   const [isDark, setIsDark] = useState(() => {
     try {
-      return localStorage.getItem("agwr_theme") !== "light";
+      return localStorage.getItem("agwr_theme_v2") === "dark";
     } catch {
-      return true;
+      return false;
     }
   });
   useEffect(() => {
     try {
-      localStorage.setItem("agwr_theme", isDark ? "dark" : "light");
+      localStorage.setItem("agwr_theme_v2", isDark ? "dark" : "light");
     } catch {}
   }, [isDark]);
   useEffect(() => {
