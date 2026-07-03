@@ -915,12 +915,18 @@ function projectScenarios(
   cur,
   months,
   customRate = null,
-  customInflow = null
+  customInflow = null,
+  customSigma = null,
+  inflowGrowthPct = 0
 ) {
   const st = getScenarioStats(pd);
   const mean = customRate !== null ? customRate / 100 : st.avgReturn / 100;
-  const sigma = st.sigma / 100;
+  const sigma = customSigma !== null ? customSigma / 100 : st.sigma / 100;
   const inflow = customInflow !== null ? customInflow : st.avgInflow;
+  // 投入年增率：第 i 個月的投入＝基準投入 × (1+g)^(經過年數)，模擬薪資成長
+  const inflows = [];
+  for (let i = 1; i <= months; i++)
+    inflows.push(inflow * Math.pow(1 + inflowGrowthPct / 100, (i - 1) / 12));
   const N = 500;
   const rng = mulberry32(20260702);
   const randn = makeRandn(rng);
@@ -929,7 +935,7 @@ function projectScenarios(
     let v = cur;
     const pts = [v];
     for (let i = 1; i <= months; i++) {
-      v = v * (1 + mean + sigma * randn()) + inflow;
+      v = v * (1 + mean + sigma * randn()) + inflows[i - 1];
       v = Math.max(0, v);
       pts.push(v);
     }
@@ -952,7 +958,7 @@ function projectScenarios(
       });
     });
   }
-  return defs.map((d, di) => {
+  const scenarios = defs.map((d, di) => {
     const points = pointsByDef[di];
     return {
       ...d,
@@ -963,6 +969,8 @@ function projectScenarios(
       inflowUsed: inflow,
     };
   });
+  // 一併回傳原始路徑，供「達標機率」計算（500 條中有幾條在期限內曾達標）
+  return { scenarios, paths };
 }
 function cashRC(r) {
   return r < 3 ? T.negative : r < 5 ? T.amber : r > 25 ? T.amber : T.emerald;
@@ -1022,9 +1030,15 @@ export default function App() {
   const [sortDir, setSortDir] = useState("desc");
   const [scenarioRate, setScenarioRate] = useState(null);
   const [scenarioInflow, setScenarioInflow] = useState(null);
+  // σ 滑桿：近 12 個月若剛好平靜，自動 σ 會太窄給假信心，可手動放大測壓力情境
+  const [scenarioSigma, setScenarioSigma] = useState(null);
+  // 投入年增率：月投入隨年資成長（薪資調升），0 = 維持固定投入
+  const [scenarioInflowGrowth, setScenarioInflowGrowth] = useState(0);
   // 滑桿顯示用即時值；Monte Carlo 吃 150ms 防抖值，拖曳時不會每個 tick 重跑 500 條路徑
   const debScenarioRate = useDebouncedValue(scenarioRate, 150);
   const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
+  const debScenarioSigma = useDebouncedValue(scenarioSigma, 150);
+  const debScenarioInflowGrowth = useDebouncedValue(scenarioInflowGrowth, 150);
   const [animTab, setAnimTab] = useState(activeTab);
   const visitedTabsRef = useRef(null);
   if (visitedTabsRef.current === null)
@@ -1273,7 +1287,7 @@ export default function App() {
     const t = basisPd.length;
     return t ? (basisPd.filter((r) => r.returnRate > 0).length / t) * 100 : 0;
   }, [basisPd]);
-  const scenarios = useMemo(
+  const scenarioSim = useMemo(
     () =>
       latest
         ? projectScenarios(
@@ -1281,11 +1295,22 @@ export default function App() {
             latest.totalAssets,
             scenarioMonths,
             debScenarioRate,
-            debScenarioInflow
+            debScenarioInflow,
+            debScenarioSigma,
+            debScenarioInflowGrowth
           )
-        : [],
-    [pd, latest, scenarioMonths, debScenarioRate, debScenarioInflow]
+        : null,
+    [
+      pd,
+      latest,
+      scenarioMonths,
+      debScenarioRate,
+      debScenarioInflow,
+      debScenarioSigma,
+      debScenarioInflowGrowth,
+    ]
   );
+  const scenarios = scenarioSim ? scenarioSim.scenarios : [];
   const scenarioDefaults = useMemo(() => getScenarioStats(pd), [pd]);
   const scData = useMemo(
     () =>
@@ -1313,6 +1338,18 @@ export default function App() {
     });
     return m;
   }, [scenarios, goalValue]);
+  // 目標達成機率：500 條路徑中，在模擬期限內「曾經」達到目標金額的比例
+  const goalProb = useMemo(() => {
+    if (!goalValue || !scenarioSim) return null;
+    const hit = scenarioSim.paths.filter((pt) =>
+      pt.some((v) => v >= goalValue)
+    ).length;
+    return {
+      pct: (hit / scenarioSim.paths.length) * 100,
+      hit,
+      total: scenarioSim.paths.length,
+    };
+  }, [scenarioSim, goalValue]);
   // 成長貢獻分解：總資產 = 起始資產 + 累計投入 + 累計報酬
   const contribData = useMemo(() => {
     if (pd.length < 2) return null;
@@ -1391,32 +1428,55 @@ export default function App() {
   const fireStats = useMemo(() => {
     if (!fireExpense || fireExpense <= 0 || !latest) return null;
     const INFL = 0.02;
+    const HORIZON = 600; // 最長推算 50 年：不再顯示「未達成」，一律給出實際落點
     const multiple = 100 / fireSwr;
     const fireNumber = Math.round(fireExpense * multiple);
     const usesNetWorth = Number(latest.liabilities || 0) > 0;
     const base = usesNetWorth ? latest.netWorth : latest.totalAssets;
-    const sc = projectScenarios(
+    const sim = projectScenarios(
       pd,
       Math.max(0, base),
-      240,
+      HORIZON,
       debScenarioRate,
-      debScenarioInflow
+      debScenarioInflow,
+      debScenarioSigma,
+      debScenarioInflowGrowth
     );
     const targetAt = (i) => fireNumber * Math.pow(1 + INFL, i / 12);
-    const reach = sc.map((s) => ({
+    const reach = sim.scenarios.map((s) => ({
       key: s.key,
       label: s.label,
       idx: s.points.findIndex((p, i) => p.value >= targetAt(i)),
     }));
+    // 達成機率：路徑在 m 個月內曾越過（隨通膨成長的）門檻的比例
+    const probWithin = (m) =>
+      (sim.paths.filter((pt) => {
+        const end = Math.min(m, pt.length - 1);
+        for (let i = 0; i <= end; i++) if (pt[i] >= targetAt(i)) return true;
+        return false;
+      }).length /
+        sim.paths.length) *
+      100;
     return {
       fireNumber,
       multiple,
       usesNetWorth,
       base,
       reach,
+      prob10y: probWithin(120),
+      prob20y: probWithin(240),
       progress: Math.min(100, Math.max(0, (base / fireNumber) * 100)),
     };
-  }, [fireExpense, fireSwr, latest, pd, debScenarioRate, debScenarioInflow]);
+  }, [
+    fireExpense,
+    fireSwr,
+    latest,
+    pd,
+    debScenarioRate,
+    debScenarioInflow,
+    debScenarioSigma,
+    debScenarioInflowGrowth,
+  ]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
     const cur = latest.totalAssets,
@@ -3849,6 +3909,42 @@ export default function App() {
               <div className="slider-group">
                 <label className="slider-label">
                   <SlidersHorizontal size={13} />
+                  月波動假設 σ{" "}
+                  <span className="mono slider-val">
+                    {scenarioSigma === null ? (
+                      <>
+                        自動{" "}
+                        <span className="slider-auto-hint">
+                          ({scenarioDefaults.sigma.toFixed(1)}%)
+                        </span>
+                      </>
+                    ) : (
+                      `${scenarioSigma.toFixed(1)}%`
+                    )}
+                  </span>
+                </label>
+                <input
+                  type="range"
+                  className="range-input"
+                  min={0}
+                  max={15}
+                  step={0.1}
+                  aria-label="月波動假設 σ（%）"
+                  value={scenarioSigma ?? (scenarioDefaults.sigma || 0)}
+                  onChange={(e) => setScenarioSigma(Number(e.target.value))}
+                />
+                {scenarioSigma !== null && (
+                  <button
+                    className="btn-reset-sm"
+                    onClick={() => setScenarioSigma(null)}
+                  >
+                    重置
+                  </button>
+                )}
+              </div>
+              <div className="slider-group">
+                <label className="slider-label">
+                  <SlidersHorizontal size={13} />
                   月均投入{" "}
                   <span className="mono slider-val">
                     {scenarioInflow === null ? (
@@ -3879,6 +3975,42 @@ export default function App() {
                   <button
                     className="btn-reset-sm"
                     onClick={() => setScenarioInflow(null)}
+                  >
+                    重置
+                  </button>
+                )}
+              </div>
+              <div className="slider-group">
+                <label className="slider-label">
+                  <SlidersHorizontal size={13} />
+                  投入年增率{" "}
+                  <span className="mono slider-val">
+                    {scenarioInflowGrowth === 0 ? (
+                      <>
+                        0%{" "}
+                        <span className="slider-auto-hint">（固定投入）</span>
+                      </>
+                    ) : (
+                      `${scenarioInflowGrowth.toFixed(1)}%／年`
+                    )}
+                  </span>
+                </label>
+                <input
+                  type="range"
+                  className="range-input"
+                  min={0}
+                  max={10}
+                  step={0.5}
+                  aria-label="投入年增率（%，模擬薪資成長）"
+                  value={scenarioInflowGrowth}
+                  onChange={(e) =>
+                    setScenarioInflowGrowth(Number(e.target.value))
+                  }
+                />
+                {scenarioInflowGrowth !== 0 && (
+                  <button
+                    className="btn-reset-sm"
+                    onClick={() => setScenarioInflowGrowth(0)}
                   >
                     重置
                   </button>
@@ -3947,6 +4079,16 @@ export default function App() {
                 );
               })}
             </div>
+            {goalValue > 0 && goalProb && (
+              <div className="assumption-bar si si-2">
+                <Target size={13} />
+                <span>
+                  依目前假設，{scenarioMonths} 個月內達成目標的機率約{" "}
+                  <b className="mono">{goalProb.pct.toFixed(0)}%</b>（
+                  {goalProb.total} 條模擬路徑中 {goalProb.hit} 條曾達標）
+                </span>
+              </div>
+            )}
             <div className="chart-wrap si si-3">
               <ResponsiveContainer width="100%" height={360}>
                 <AreaChart data={scData}>
@@ -4081,8 +4223,8 @@ export default function App() {
                   {Number.isInteger(100 / fireSwr)
                     ? 100 / fireSwr
                     : (100 / fireSwr).toFixed(1)}
-                  ；達標門檻隨每年 2% 通膨成長。沿用上方模擬假設（μ／月投入）推
-                  20 年，有負債時以淨值計算。
+                  ；達標門檻隨每年 2% 通膨成長。沿用上方模擬假設（μ／σ／投入）推算至
+                  50 年，有負債時以淨值計算。
                 </p>
               </div>
               <div className="seg-group">
@@ -4106,9 +4248,8 @@ export default function App() {
               <div className="alert alert-warn">
                 模擬使用的月報酬 μ {fireMuWarn.mu.toFixed(1)}%（年化約{" "}
                 {fireMuWarn.annual.toFixed(0)}
-                %）高於長期市場合理水準，推 20
-                年會過度樂觀。建議用上方「月均報酬假設」滑桿降到 0.4～0.6%
-                再看達成時間。
+                %）高於長期市場合理水準，長期外推會過度樂觀。建議用上方「月均報酬假設」滑桿降到
+                0.4～0.6% 再看達成時間。
               </div>
             )}
             <div className="fire-grid">
@@ -4167,6 +4308,18 @@ export default function App() {
                         )}
                       </span>
                     </div>
+                    <div className="goal-rows">
+                      <PRow
+                        l="10 年內達成機率"
+                        v={`${fireStats.prob10y.toFixed(0)}%`}
+                        c={fireStats.prob10y >= 50 ? T.positive : T.amber}
+                      />
+                      <PRow
+                        l="20 年內達成機率"
+                        v={`${fireStats.prob20y.toFixed(0)}%`}
+                        c={fireStats.prob20y >= 50 ? T.positive : T.amber}
+                      />
+                    </div>
                   </div>
                 ) : (
                   <div className="preview-empty">
@@ -4184,7 +4337,7 @@ export default function App() {
                     }[r.key];
                     let label;
                     if (r.idx === 0) label = "已達成 ✦";
-                    else if (r.idx < 0) label = "20 年內未達成";
+                    else if (r.idx < 0) label = "超過 50 年（模擬上限）";
                     else {
                       const yy = Math.floor(r.idx / 12),
                         mm = r.idx % 12,
