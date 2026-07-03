@@ -519,6 +519,10 @@ function fmtPP(v) {
 function fmtD(v) {
   return `${Number(v) >= 0 ? "+" : ""}${fmtN(v)}`;
 }
+/* 月報酬 % → 年化 %（複利，(1+μ)¹²−1）：μ 顯示用 */
+function annualizePct(muPct) {
+  return (Math.pow(1 + Number(muPct || 0) / 100, 12) - 1) * 100;
+}
 function safeLoadLocal() {
   try {
     const r = localStorage.getItem(STORAGE_KEY);
@@ -3887,7 +3891,8 @@ export default function App() {
                 {scenarioDefaults.excludedMonths > 0
                   ? `（已排除 ${scenarioDefaults.excludedMonths} 個未更新月份）`
                   : ""}
-                ｜月報酬 μ {scenarioDefaults.avgReturn.toFixed(1)}%・σ{" "}
+                ｜月報酬 μ {scenarioDefaults.avgReturn.toFixed(1)}%（年化{" "}
+                {annualizePct(scenarioDefaults.avgReturn).toFixed(1)}%）・σ{" "}
                 {scenarioDefaults.sigma.toFixed(1)}%｜月均投入{" "}
                 {mask(`NT$ ${fmtN(Math.round(scenarioDefaults.avgInflow))}`)}
                 ・年增{" "}
@@ -3931,11 +3936,18 @@ export default function App() {
                       <>
                         自動{" "}
                         <span className="slider-auto-hint">
-                          ({scenarioDefaults.avgReturn.toFixed(1)}%)
+                          ({scenarioDefaults.avgReturn.toFixed(1)}%・年化{" "}
+                          {annualizePct(scenarioDefaults.avgReturn).toFixed(1)}
+                          %)
                         </span>
                       </>
                     ) : (
-                      `${scenarioRate.toFixed(1)}%`
+                      <>
+                        {scenarioRate.toFixed(1)}%{" "}
+                        <span className="slider-auto-hint">
+                          (年化 {annualizePct(scenarioRate).toFixed(1)}%)
+                        </span>
+                      </>
                     )}
                   </span>
                 </label>
