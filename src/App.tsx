@@ -3857,6 +3857,8 @@ export default function App() {
                 <option value={12}>12M</option>
                 <option value={24}>24M</option>
                 <option value={36}>36M</option>
+                <option value={60}>60M（5年）</option>
+                <option value={120}>120M（10年）</option>
               </select>
             </div>
             <div className="assumption-bar si si-1">
@@ -4065,7 +4067,11 @@ export default function App() {
                       />
                       )
                     </div>
-                    <div className="sc-sum-period">{scenarioMonths} 個月後</div>
+                    <div className="sc-sum-period">
+                      {scenarioMonths >= 60
+                        ? `${scenarioMonths / 12} 年後`
+                        : `${scenarioMonths} 個月後`}
+                    </div>
                     {goalValue > 0 && latest && reach !== null && (
                       <div className="sc-sum-goal">
                         {reach === 0
@@ -4086,7 +4092,11 @@ export default function App() {
               <div className="assumption-bar si si-2">
                 <Target size={13} />
                 <span>
-                  依目前假設，{scenarioMonths} 個月內達成目標的機率約{" "}
+                  依目前假設，
+                  {scenarioMonths >= 60
+                    ? `${scenarioMonths / 12} 年`
+                    : `${scenarioMonths} 個月`}
+                  內達成目標的機率約{" "}
                   <b className="mono">{goalProb.pct.toFixed(0)}%</b>（
                   {goalProb.total} 條模擬路徑中 {goalProb.hit} 條曾達標）
                 </span>
