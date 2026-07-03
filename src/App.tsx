@@ -1983,9 +1983,12 @@ export default function App() {
       const total = Math.round(
         d.assets.reduce((sum, a) => sum + convertAssetToTwd(a, fx), 0)
       );
+      // 現金＝「現金」＋「緊急備用金」：備用金本質是現金部位，月度紀錄的現金占比才不會失真
       const cash = Math.round(
         d.assets
-          .filter((a) => a.category === "現金")
+          .filter(
+            (a) => a.category === "現金" || a.category === EMERGENCY_CATEGORY
+          )
           .reduce((sum, a) => sum + convertAssetToTwd(a, fx), 0)
       );
       setFormData((prev) => ({
@@ -1995,8 +1998,8 @@ export default function App() {
       }));
       setToast(
         privacy
-          ? "已帶入資產配置數值（現金＝「現金」類合計）"
-          : `已帶入：總資產 ${fmtN(total)}／現金 ${fmtN(cash)}（現金＝「現金」類合計）`
+          ? "已帶入資產配置數值（現金＝現金＋緊急備用金）"
+          : `已帶入：總資產 ${fmtN(total)}／現金 ${fmtN(cash)}（現金＝現金＋緊急備用金）`
       );
     } catch {
       setToast("帶入失敗");
@@ -2276,7 +2279,7 @@ export default function App() {
               <button
                 className="btn-ghost"
                 onClick={importFromAllocation}
-                title="讀取「資產配置」分頁目前的總資產與現金（現金＝「現金」類合計）"
+                title="讀取「資產配置」分頁目前的總資產與現金（現金＝「現金」＋「緊急備用金」合計）"
               >
                 <Wallet size={14} />
                 從資產配置帶入
@@ -5088,6 +5091,7 @@ const DEFAULT_CATEGORY_ORDER = [
   "基金",
   "台股",
   "現金",
+  "緊急備用金",
   "虛擬貨幣",
   "其他",
 ];
@@ -5098,6 +5102,7 @@ const CATEGORY_COLORS = {
   基金: "#8A6A2E",
   台股: "#2D6A4F",
   現金: "#52B788",
+  緊急備用金: "#3D6E6B",
   虛擬貨幣: "#A63228",
   其他: "#A8A8AD",
 };
@@ -5109,11 +5114,20 @@ const CATEGORY_COLORS_DARK = {
   基金: "#FBBF24",
   台股: "#10B981",
   現金: "#38BDF8",
+  緊急備用金: "#14B8A6",
   虛擬貨幣: "#EF4444",
   其他: "#8FA3BE",
 };
 
 const DEFAULT_COLOR = "#94A3B8";
+
+/* 緊急備用金：算入總資產與資產分佈，但不參與目標配置——
+   偏離度、再平衡建議、達標圖表、目標總占比都排除；
+   其餘類別的占比對比一律以「可投資資產＝總資產−備用金」為分母 */
+const EMERGENCY_CATEGORY = "緊急備用金";
+function isEmergencyAsset(a) {
+  return (a && a.category) === EMERGENCY_CATEGORY;
+}
 
 const INITIAL_DATA = [
   {
@@ -5530,6 +5544,7 @@ button,input,select{font:inherit;}
 .gap-badge{display:inline-flex;align-items:center;gap:5px;padding:6px 10px;border-radius:var(--radius-sm);font-size:11px;font-family:var(--mono);font-weight:800;}
 .gap-badge.over{color:var(--c-red);background:var(--c-red-dim);}
 .gap-badge.under{color:var(--c-green);background:var(--c-green-dim);}
+.gap-badge.neutral{color:var(--c-text-3);background:var(--c-surface-3);}
 .sort-actions{display:inline-flex;gap:4px;align-items:center;}
 .sort-btn{width:30px;height:30px;border:1px solid var(--c-border-2);border-radius:8px;background:var(--c-surface-2);color:var(--c-text-3);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:all 0.15s ease;}
 .sort-btn:hover{color:var(--c-text);background:var(--c-surface-3);}
@@ -5800,6 +5815,7 @@ function CategoryIcon({ category }) {
   if (category === "美股") return <BrickWall {...props} />;
   if (category.includes("基金")) return <Coins {...props} />;
   if (category.includes("台股")) return <Layers {...props} />;
+  if (category.includes("備用")) return <Shield {...props} />;
   if (category.includes("現金")) return <Banknote {...props} />;
   if (category.includes("虛擬")) return <Bitcoin {...props} />;
   if (category.includes("房產")) return <LandPlot {...props} />;
@@ -6354,7 +6370,10 @@ function AssetWarroomTab({ isDark, privacy, active }) {
     const dynamic = Array.from(
       new Set(assets.map((a) => a.category || "其他"))
     );
-    return Array.from(new Set([...categoryOrder, ...dynamic]));
+    // 合併預設清單：既有使用者的 categoryOrder 沒有新類別（如緊急備用金）時，下拉選單也選得到
+    return Array.from(
+      new Set([...categoryOrder, ...DEFAULT_CATEGORY_ORDER, ...dynamic])
+    );
   }, [assets, categoryOrder]);
 
   const categories = useMemo(
@@ -6370,6 +6389,16 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       ),
     [assets, refData.usdToTwd]
   );
+
+  // 緊急備用金合計與可投資資產：目標相關計算一律用 investableValue 當分母
+  const emergencyValue = useMemo(
+    () =>
+      assets
+        .filter(isEmergencyAsset)
+        .reduce((s, i) => s + convertAssetToTwd(i, refData.usdToTwd), 0),
+    [assets, refData.usdToTwd]
+  );
+  const investableValue = totalValue - emergencyValue;
 
   const filteredAssets = useMemo(() => {
     let list = [...assets];
@@ -6463,12 +6492,15 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   const barData = useMemo(
     () =>
       orderedCategories
+        .filter((cat) => cat !== EMERGENCY_CATEGORY)
         .map((cat) => {
           const d = globalCategoryStats[cat];
           if (!d) return null;
           const currentPct =
-            totalValue > 0
-              ? parseFloat(((d.currentVal / totalValue) * 100).toFixed(1))
+            investableValue > 0
+              ? parseFloat(
+                  ((d.currentVal / investableValue) * 100).toFixed(1)
+                )
               : 0;
           return {
             name: cat,
@@ -6478,28 +6510,33 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           };
         })
         .filter(Boolean),
-    [globalCategoryStats, totalValue, orderedCategories]
+    [globalCategoryStats, investableValue, orderedCategories]
   );
 
   const deviationScore = useMemo(() => {
-    if (totalValue === 0) return "0.0";
+    if (investableValue === 0) return "0.0";
     let totalDiff = 0;
-    Object.values(globalCategoryStats).forEach((d) => {
-      totalDiff += Math.abs((d.currentVal / totalValue) * 100 - d.targetPct);
+    Object.entries(globalCategoryStats).forEach(([cat, d]) => {
+      if (cat === EMERGENCY_CATEGORY) return;
+      totalDiff += Math.abs(
+        (d.currentVal / investableValue) * 100 - d.targetPct
+      );
     });
     return (totalDiff / 2).toFixed(1);
-  }, [globalCategoryStats, totalValue]);
+  }, [globalCategoryStats, investableValue]);
 
   const rebalanceHints = useMemo(() => {
     const hints = [];
     assets.forEach((a) => {
+      if (isEmergencyAsset(a)) return;
       const targetPct = Number(a.targetPercent) || 0;
       // 未設定目標的資產不進建議清單，避免整排「賣出」噪音
       if (targetPct <= 0) return;
       const twdVal = convertAssetToTwd(a, refData.usdToTwd);
-      const curPct = totalValue > 0 ? (twdVal / totalValue) * 100 : 0;
+      const curPct =
+        investableValue > 0 ? (twdVal / investableValue) * 100 : 0;
       const diffPct = curPct - targetPct;
-      const targetVal = totalValue * (targetPct / 100);
+      const targetVal = investableValue * (targetPct / 100);
       const diffVal = twdVal - targetVal;
       if (Math.abs(diffPct) > 1 || Math.abs(diffVal) > 50000) {
         hints.push({
@@ -6515,7 +6552,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       }
     });
     return hints.sort((a, b) => b.diffVal - a.diffVal).slice(0, 6);
-  }, [assets, totalValue, refData.usdToTwd]);
+  }, [assets, investableValue, refData.usdToTwd]);
 
   const allTargetsZero = useMemo(
     () =>
@@ -6537,20 +6574,25 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   );
 
   const highestTargetGap = useMemo(() => {
-    if (!assets.length || totalValue === 0) return null;
-    return assets
+    const pool = assets.filter((i) => !isEmergencyAsset(i));
+    if (!pool.length || investableValue === 0) return null;
+    return pool
       .map((i) => {
         const t = convertAssetToTwd(i, refData.usdToTwd);
         return {
           ...i,
-          diffAbs: Math.abs((t / totalValue) * 100 - i.targetPercent),
+          diffAbs: Math.abs((t / investableValue) * 100 - i.targetPercent),
         };
       })
       .sort((a, b) => b.diffAbs - a.diffAbs)[0];
-  }, [assets, totalValue, refData.usdToTwd]);
+  }, [assets, investableValue, refData.usdToTwd]);
 
   const totalTargetPercent = useMemo(
-    () => assets.reduce((s, i) => s + (Number(i.targetPercent) || 0), 0),
+    () =>
+      assets.reduce(
+        (s, i) => s + (isEmergencyAsset(i) ? 0 : Number(i.targetPercent) || 0),
+        0
+      ),
     [assets]
   );
   const usdAssetValue = useMemo(
@@ -6665,9 +6707,11 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       });
       let totalDiff = 0;
       prev.categoryBreakdown.forEach((i) => {
+        if (i.category === EMERGENCY_CATEGORY) return;
         totalDiff += Math.abs(i.percent - (targetMap[i.category] || 0));
       });
       Object.keys(targetMap).forEach((cat) => {
+        if (cat === EMERGENCY_CATEGORY) return;
         if (!prev.categoryBreakdown.some((i) => i.category === cat))
           totalDiff += Math.abs(targetMap[cat]);
       });
@@ -7017,10 +7061,11 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       name,
       value: Number(newAsset.value) || 0,
       currency: newAsset.currency || "TWD",
-      targetPercent: Math.min(
-        100,
-        Math.max(0, Number(newAsset.targetPercent) || 0)
-      ),
+      // 緊急備用金不參與配置，目標一律 0
+      targetPercent:
+        newAsset.category === EMERGENCY_CATEGORY
+          ? 0
+          : Math.min(100, Math.max(0, Number(newAsset.targetPercent) || 0)),
     };
     setAssets((prev) => [...prev, item]);
     setExpandedCategories((prev) => ({ ...prev, [item.category]: true }));
@@ -7258,11 +7303,20 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           </div>
           <input
             type="number"
-            placeholder="目標占比 % (選填)"
+            placeholder={
+              newAsset.category === EMERGENCY_CATEGORY
+                ? "不列入配置"
+                : "目標占比 % (選填)"
+            }
             min="0"
             max="100"
+            disabled={newAsset.category === EMERGENCY_CATEGORY}
             className={newAssetErrors.targetPercent ? "invalid" : ""}
-            value={newAsset.targetPercent}
+            value={
+              newAsset.category === EMERGENCY_CATEGORY
+                ? ""
+                : newAsset.targetPercent
+            }
             onChange={(e) => {
               setNewAsset((p) => ({ ...p, targetPercent: e.target.value }));
               setNewAssetErrors((p) => ({ ...p, targetPercent: false }));
@@ -7520,6 +7574,12 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                       <div className="hero-total-sub">
                         共 {assets.length} 項資產｜美元匯率 {refData.usdToTwd}
                         ｜目標總占比 {totalTargetPercent.toFixed(1)}%
+                        {emergencyValue > 0 && (
+                          <>
+                            ｜緊急備用金{" "}
+                            {maskMoney(formatCompact(emergencyValue))}
+                          </>
+                        )}
                       </div>
                       <div className="hero-total-mini-grid">
                         {[
@@ -8054,7 +8114,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                         類別達標狀況
                       </div>
                       <div className="aw-card-desc">
-                        比較各類別目前占比與目標占比的距離。
+                        比較各類別目前占比與目標占比的距離（以可投資資產為分母，緊急備用金不列入）。
                       </div>
                       <div
                         className="aw-chart-wrap"
@@ -8503,13 +8563,22 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                         />
                         <input
                           type="number"
-                          placeholder="目標占比 %"
+                          placeholder={
+                            newAsset.category === EMERGENCY_CATEGORY
+                              ? "不列入配置"
+                              : "目標占比 %"
+                          }
                           min="0"
                           max="100"
+                          disabled={newAsset.category === EMERGENCY_CATEGORY}
                           className={
                             newAssetErrors.targetPercent ? "invalid" : ""
                           }
-                          value={newAsset.targetPercent}
+                          value={
+                            newAsset.category === EMERGENCY_CATEGORY
+                              ? ""
+                              : newAsset.targetPercent
+                          }
                           onChange={(e) => {
                             setNewAsset((p) => ({
                               ...p,
@@ -8575,9 +8644,14 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                     const gstat = globalCategoryStats[cat] || stat;
                     const isExpanded = expandedCategories[cat];
                     const catColor = getCategoryColor(cat, isDark);
+                    const isEmergencyCat = cat === EMERGENCY_CATEGORY;
+                    // 備用金顯示佔總資產比例；其餘類別以可投資資產為分母對比目標
+                    const catDenom = isEmergencyCat
+                      ? totalValue
+                      : investableValue;
                     const catCurrentPct =
-                      totalValue > 0
-                        ? ((gstat.currentVal / totalValue) * 100).toFixed(1)
+                      catDenom > 0
+                        ? ((gstat.currentVal / catDenom) * 100).toFixed(1)
                         : "0.0";
                     const catGap = (
                       Number(catCurrentPct) - gstat.targetPct
@@ -8642,27 +8716,35 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                               </div>
                             </div>
                             <div className="cat-box">
-                              <div className="cat-label">目前 / 目標</div>
+                              <div className="cat-label">
+                                {isEmergencyCat ? "佔總資產" : "目前 / 目標"}
+                              </div>
                               <div className="cat-value">
-                                <strong>{catCurrentPct}%</strong> /{" "}
-                                {gstat.targetPct}%
+                                <strong>{catCurrentPct}%</strong>
+                                {!isEmergencyCat && <> / {gstat.targetPct}%</>}
                               </div>
                             </div>
                             <div className="cat-box">
                               <div className="cat-label">差距</div>
-                              <div
-                                className={`gap-badge ${
-                                  isOver ? "over" : "under"
-                                }`}
-                              >
-                                <Triangle
-                                  size={9}
-                                  className={isOver ? "t-down" : "t-up"}
-                                  fill="currentColor"
-                                />
-                                {isOver ? "+" : ""}
-                                {catGap}%
-                              </div>
+                              {isEmergencyCat ? (
+                                <div className="gap-badge neutral">
+                                  不列入配置
+                                </div>
+                              ) : (
+                                <div
+                                  className={`gap-badge ${
+                                    isOver ? "over" : "under"
+                                  }`}
+                                >
+                                  <Triangle
+                                    size={9}
+                                    className={isOver ? "t-down" : "t-up"}
+                                    fill="currentColor"
+                                  />
+                                  {isOver ? "+" : ""}
+                                  {catGap}%
+                                </div>
+                              )}
                             </div>
                             {manualMode && (
                               <div
@@ -8763,16 +8845,20 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                       item,
                                       refData.usdToTwd
                                     );
+                                    const rowDenom = isEmergencyCat
+                                      ? totalValue
+                                      : investableValue;
                                     const currentPct =
-                                      totalValue > 0
+                                      rowDenom > 0
                                         ? (
-                                            (twdValue / totalValue) *
+                                            (twdValue / rowDenom) *
                                             100
                                           ).toFixed(1)
                                         : "0.0";
                                     const diff =
                                       twdValue -
-                                      totalValue * (item.targetPercent / 100);
+                                      investableValue *
+                                        (item.targetPercent / 100);
                                     const isActionOver = diff > 0;
                                     const inputCurrency =
                                       getDisplayCurrency(item);
@@ -8812,6 +8898,8 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                                 ? "FUND"
                                                 : cat.includes("虛擬")
                                                 ? "CRYPTO"
+                                                : cat.includes("備用")
+                                                ? "RESERVE"
                                                 : cat.includes("現金")
                                                 ? "CASH"
                                                 : "ASSET"}
@@ -8925,57 +9013,72 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                           {maskMoney(formatCurrency(twdValue))}
                                         </td>
                                         <td style={{ textAlign: "right" }}>
-                                          <div className="percent-inline">
-                                            <div className="percent-box">
-                                              <input
-                                                className="percent-input"
-                                                type="number"
-                                                min="0"
-                                                max="100"
-                                                aria-label={`${item.name} 目標占比`}
-                                                value={item.targetPercent}
-                                                onChange={(e) =>
-                                                  updateAsset(
-                                                    item.id,
-                                                    "targetPercent",
-                                                    e.target.value
-                                                  )
-                                                }
-                                              />
+                                          {isEmergencyCat ? (
+                                            <span
+                                              className="current-pct"
+                                              title="緊急備用金不列入目標配置"
+                                            >
+                                              — / {currentPct}%
+                                            </span>
+                                          ) : (
+                                            <div className="percent-inline">
+                                              <div className="percent-box">
+                                                <input
+                                                  className="percent-input"
+                                                  type="number"
+                                                  min="0"
+                                                  max="100"
+                                                  aria-label={`${item.name} 目標占比`}
+                                                  value={item.targetPercent}
+                                                  onChange={(e) =>
+                                                    updateAsset(
+                                                      item.id,
+                                                      "targetPercent",
+                                                      e.target.value
+                                                    )
+                                                  }
+                                                />
+                                                <span
+                                                  style={{
+                                                    color: "var(--c-text-3)",
+                                                    fontWeight: 700,
+                                                    fontSize: 12,
+                                                  }}
+                                                >
+                                                  %
+                                                </span>
+                                              </div>
                                               <span
                                                 style={{
                                                   color: "var(--c-text-3)",
                                                   fontWeight: 700,
-                                                  fontSize: 12,
                                                 }}
                                               >
-                                                %
+                                                /
+                                              </span>
+                                              <span className="current-pct">
+                                                {currentPct}%
                                               </span>
                                             </div>
-                                            <span
-                                              style={{
-                                                color: "var(--c-text-3)",
-                                                fontWeight: 700,
-                                              }}
-                                            >
-                                              /
-                                            </span>
-                                            <span className="current-pct">
-                                              {currentPct}%
-                                            </span>
-                                          </div>
+                                          )}
                                         </td>
                                         <td style={{ textAlign: "right" }}>
-                                          <div
-                                            className={`diff-chip ${
-                                              isActionOver ? "over" : "under"
-                                            }`}
-                                          >
-                                            {isActionOver ? "+" : ""}
-                                            {maskMoney(
-                                              formatCompactFixed(diff)
-                                            )}
-                                          </div>
+                                          {isEmergencyCat ? (
+                                            <span className="current-pct">
+                                              —
+                                            </span>
+                                          ) : (
+                                            <div
+                                              className={`diff-chip ${
+                                                isActionOver ? "over" : "under"
+                                              }`}
+                                            >
+                                              {isActionOver ? "+" : ""}
+                                              {maskMoney(
+                                                formatCompactFixed(diff)
+                                              )}
+                                            </div>
+                                          )}
                                         </td>
                                         {manualMode && (
                                           <td style={{ textAlign: "right" }}>
@@ -9046,13 +9149,16 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                 item,
                                 refData.usdToTwd
                               );
+                              const rowDenom = isEmergencyCat
+                                ? totalValue
+                                : investableValue;
                               const currentPct =
-                                totalValue > 0
-                                  ? ((twdValue / totalValue) * 100).toFixed(1)
+                                rowDenom > 0
+                                  ? ((twdValue / rowDenom) * 100).toFixed(1)
                                   : "0.0";
                               const diff =
                                 twdValue -
-                                totalValue * (item.targetPercent / 100);
+                                investableValue * (item.targetPercent / 100);
                               const isActionOver = diff > 0;
                               const inputCurrency = getDisplayCurrency(item);
                               return (
@@ -9100,32 +9206,42 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                     </div>
                                     <div className="mobile-asset-card-field">
                                       <div className="mobile-asset-card-field-label">
-                                        目標 / 目前
+                                        {isEmergencyCat
+                                          ? "佔總資產"
+                                          : "目標 / 目前"}
                                       </div>
                                       <div
                                         className="mobile-asset-card-field-value"
                                         style={{ color: "var(--c-accent)" }}
                                       >
-                                        {item.targetPercent}% / {currentPct}%
+                                        {isEmergencyCat
+                                          ? `${currentPct}%`
+                                          : `${item.targetPercent}% / ${currentPct}%`}
                                       </div>
                                     </div>
                                     <div className="mobile-asset-card-field">
                                       <div className="mobile-asset-card-field-label">
                                         差距
                                       </div>
-                                      <div
-                                        className={`diff-chip ${
-                                          isActionOver ? "over" : "under"
-                                        }`}
-                                        style={{
-                                          fontSize: 11,
-                                          padding: "3px 8px",
-                                          width: "fit-content",
-                                        }}
-                                      >
-                                        {isActionOver ? "+" : ""}
-                                        {maskMoney(formatCompactFixed(diff))}
-                                      </div>
+                                      {isEmergencyCat ? (
+                                        <div className="mobile-asset-card-field-value">
+                                          —
+                                        </div>
+                                      ) : (
+                                        <div
+                                          className={`diff-chip ${
+                                            isActionOver ? "over" : "under"
+                                          }`}
+                                          style={{
+                                            fontSize: 11,
+                                            padding: "3px 8px",
+                                            width: "fit-content",
+                                          }}
+                                        >
+                                          {isActionOver ? "+" : ""}
+                                          {maskMoney(formatCompactFixed(diff))}
+                                        </div>
+                                      )}
                                     </div>
                                   </div>
                                 </div>
