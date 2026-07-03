@@ -847,13 +847,14 @@ function getFirebaseServices() {
   return { app: _fbApp, auth: _fbAuth, db: _fbDb };
 }
 /* 匿名登入去重：主 App 與資產配置分頁各自監聽 auth，user 為 null 時
-   兩邊會同時要求登入，這裡共用同一個 Promise 避免重複發出匿名登入請求 */
+   兩邊會同時要求登入，這裡共用同一個 Promise 避免重複發出匿名登入請求。
+   settle 後一律清空：成功後若 Firebase 中途登出（token 失效等），
+   下次 user 為 null 時才會發出新的登入請求；進行中的併發呼叫仍共用同一個 Promise */
 let _anonSignInPromise = null;
 function ensureAnonSignIn(auth) {
   if (!_anonSignInPromise) {
-    _anonSignInPromise = signInAnonymously(auth).catch((e) => {
+    _anonSignInPromise = signInAnonymously(auth).finally(() => {
       _anonSignInPromise = null;
-      throw e;
     });
   }
   return _anonSignInPromise;
@@ -1363,28 +1364,59 @@ export default function App() {
     const ann = chain > 0 ? (Math.pow(chain, 12 / n) - 1) * 100 : 0;
     return { cum, ann };
   }, [basisPd, pd]);
-  // FIRE：自由數字 = 年支出 × 25（4% 法則），沿用滑桿假設推 20 年
+  // ── FIRE 設定與計算 ──
+  // 提領率可選 4%／3.5%／3.25%（×25／×28.6／×30.8）：4% 法則以 30 年退休期回測，
+  // 提早退休（40 年以上）學界普遍建議 3.25~3.5%。選擇存在本機。
+  const [fireSwr, setFireSwr] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("agwr_fire_swr"));
+      return [4, 3.5, 3.25].includes(v) ? v : 4;
+    } catch {
+      return 4;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("agwr_fire_swr", String(fireSwr));
+    } catch {}
+  }, [fireSwr]);
+  // 樂觀警示：模擬用的 μ 年化超過 10% 時提醒（牛市 12 個月的統計外推 20 年會失真）
+  const fireMuWarn = useMemo(() => {
+    const mu = scenarioRate ?? scenarioDefaults.avgReturn;
+    const annual = (Math.pow(1 + mu / 100, 12) - 1) * 100;
+    return annual > 10 ? { mu, annual } : null;
+  }, [scenarioRate, scenarioDefaults]);
+  // FIRE：自由數字＝年支出 × (100/提領率)，達標門檻隨 2% 通膨逐月成長
+  //（名目資產 vs 今天的固定目標會系統性高估進度）；有負債時起點與進度用淨值
   const fireStats = useMemo(() => {
     if (!fireExpense || fireExpense <= 0 || !latest) return null;
-    const fireNumber = fireExpense * 25;
+    const INFL = 0.02;
+    const multiple = 100 / fireSwr;
+    const fireNumber = Math.round(fireExpense * multiple);
+    const usesNetWorth = Number(latest.liabilities || 0) > 0;
+    const base = usesNetWorth ? latest.netWorth : latest.totalAssets;
     const sc = projectScenarios(
       pd,
-      latest.totalAssets,
+      Math.max(0, base),
       240,
       debScenarioRate,
       debScenarioInflow
     );
+    const targetAt = (i) => fireNumber * Math.pow(1 + INFL, i / 12);
     const reach = sc.map((s) => ({
       key: s.key,
       label: s.label,
-      idx: s.points.findIndex((p) => p.value >= fireNumber),
+      idx: s.points.findIndex((p, i) => p.value >= targetAt(i)),
     }));
     return {
       fireNumber,
+      multiple,
+      usesNetWorth,
+      base,
       reach,
-      progress: Math.min(100, (latest.totalAssets / fireNumber) * 100),
+      progress: Math.min(100, Math.max(0, (base / fireNumber) * 100)),
     };
-  }, [fireExpense, latest, pd, debScenarioRate, debScenarioInflow]);
+  }, [fireExpense, fireSwr, latest, pd, debScenarioRate, debScenarioInflow]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
     const cur = latest.totalAssets,
@@ -1711,7 +1743,13 @@ export default function App() {
   const handleUndoDel = (uid) => {
     const t = undoDels.find((u) => u.id === uid);
     if (!t) return;
-    setRecords((p) => normalizeRecords([...p, t.record]));
+    // 先濾掉同月份：刪除後 6 秒內若重新建立了同月紀錄，復原不會產生重複月份
+    setRecords((p) =>
+      normalizeRecords([
+        ...p.filter((r) => r.month !== t.record.month),
+        t.record,
+      ])
+    );
     setUndoDels((p) => p.filter((u) => u.id !== uid));
     setToast(`已復原 ${t.record.month}`);
   };
@@ -4032,14 +4070,47 @@ export default function App() {
             </div>
           </section>
           <section className="card si si-4">
-            <h3 className="card-title">
-              <Banknote size={18} className="icon-gold" />
-              財務自由（FIRE）
-            </h3>
-            <p className="card-desc">
-              4% 法則：自由數字＝年支出 ×
-              25。沿用上方相同的模擬假設（μ／月投入），最長推算 20 年。
-            </p>
+            <div className="chart-header">
+              <div>
+                <h3 className="card-title">
+                  <Banknote size={18} className="icon-gold" />
+                  財務自由（FIRE）
+                </h3>
+                <p className="card-desc">
+                  自由數字＝年支出 ×{" "}
+                  {Number.isInteger(100 / fireSwr)
+                    ? 100 / fireSwr
+                    : (100 / fireSwr).toFixed(1)}
+                  ；達標門檻隨每年 2% 通膨成長。沿用上方模擬假設（μ／月投入）推
+                  20 年，有負債時以淨值計算。
+                </p>
+              </div>
+              <div className="seg-group">
+                {[
+                  { v: 4, label: "4% 經典" },
+                  { v: 3.5, label: "3.5%" },
+                  { v: 3.25, label: "3.25% 保守" },
+                ].map((o) => (
+                  <button
+                    key={o.v}
+                    className={`seg-btn ${fireSwr === o.v ? "active" : ""}`}
+                    onClick={() => setFireSwr(o.v)}
+                    title={`提領率 ${o.v}%＝年支出 × ${(100 / o.v).toFixed(1)}`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {fireStats && fireMuWarn && (
+              <div className="alert alert-warn">
+                模擬使用的月報酬 μ {fireMuWarn.mu.toFixed(1)}%（年化約{" "}
+                {fireMuWarn.annual.toFixed(0)}
+                %）高於長期市場合理水準，推 20
+                年會過度樂觀。建議用上方「月均報酬假設」滑桿降到 0.4～0.6%
+                再看達成時間。
+              </div>
+            )}
             <div className="fire-grid">
               <div>
                 <div className="goal-input-wrap">
@@ -4058,10 +4129,20 @@ export default function App() {
                 {fireStats ? (
                   <div className="goal-body">
                     <PRow
-                      l="自由數字（×25）"
+                      l={`自由數字（×${
+                        Number.isInteger(fireStats.multiple)
+                          ? fireStats.multiple
+                          : fireStats.multiple.toFixed(1)
+                      }）`}
                       v={mask(`NT$ ${fmtN(fireStats.fireNumber)}`)}
                       c={T.gold}
                     />
+                    {fireStats.usesNetWorth && (
+                      <PRow
+                        l="計算基準（淨值）"
+                        v={mask(`NT$ ${fmtN(fireStats.base)}`)}
+                      />
+                    )}
                     <div className="progress-track">
                       <div
                         className="progress-fill"
@@ -4082,12 +4163,7 @@ export default function App() {
                       <span style={{ color: T.textTertiary }}>
                         差{" "}
                         {mask(
-                          fmtS(
-                            Math.max(
-                              0,
-                              fireStats.fireNumber - stats.totalAssets
-                            )
-                          )
+                          fmtS(Math.max(0, fireStats.fireNumber - fireStats.base))
                         )}
                       </span>
                     </div>
