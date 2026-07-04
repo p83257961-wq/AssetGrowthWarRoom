@@ -2465,7 +2465,7 @@ export default function App() {
                 value={formData.liabilities}
                 onChange={(v) => setFormData((p) => ({ ...p, liabilities: v }))}
               />
-              <div className="form-field full">
+              <div className="form-field">
                 <label className="field-label">備註</label>
                 <input
                   className="field-input"
@@ -3605,9 +3605,20 @@ export default function App() {
                           className={`hm-cell mono ${flat ? "hm-flat" : ""} ${
                             hmSel === r.month ? "hm-selected" : ""
                           }`}
+                          role="button"
+                          tabIndex={0}
+                          aria-pressed={hmSel === r.month}
                           onClick={() =>
                             setHmSel((s) => (s === r.month ? null : r.month))
                           }
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setHmSel((s) =>
+                                s === r.month ? null : r.month
+                              );
+                            }
+                          }}
                           style={
                             flat
                               ? undefined
@@ -6036,6 +6047,69 @@ function loadFromLocalStorage() {
   }
 }
 
+/* 解析資產配置 CSV（與 exportCSV 同格式、欄位以標頭名對應），回傳資產陣列或 null */
+function parseAssetsCSV(text) {
+  const clean = String(text || "").replace(/^﻿/, "");
+  const lines = clean.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) return null;
+  const parseLine = (line) => {
+    const out = [];
+    let cur = "",
+      inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (line[i + 1] === '"') {
+            cur += '"';
+            i++;
+          } else inQ = false;
+        } else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === ",") {
+        out.push(cur);
+        cur = "";
+      } else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  };
+  const header = parseLine(lines[0]).map((h) => h.trim());
+  const iCat = header.indexOf("類別"),
+    iName = header.indexOf("項目"),
+    iCur = header.indexOf("輸入幣別"),
+    iVal = header.indexOf("輸入市值"),
+    iTgt = header.indexOf("目標占比");
+  if (iCat === -1 || iName === -1 || iVal === -1) return null;
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const c = parseLine(lines[i]);
+    const name = String(c[iName] || "").trim();
+    if (!name) continue;
+    const category = String(c[iCat] || "其他").trim() || "其他";
+    const currency =
+      iCur >= 0 && String(c[iCur] || "").trim().toUpperCase() === "USD"
+        ? "USD"
+        : "TWD";
+    const value = Math.max(0, Number(c[iVal]) || 0);
+    const tgtRaw =
+      iTgt >= 0 ? String(c[iTgt] || "").replace("%", "").trim() : "0";
+    const targetPercent =
+      category === EMERGENCY_CATEGORY
+        ? 0
+        : Math.min(100, Math.max(0, Number(tgtRaw) || 0));
+    out.push({
+      id: generateId(),
+      category,
+      name,
+      value,
+      currency,
+      targetPercent,
+    });
+  }
+  return out.length ? out : null;
+}
+
 /* ═══════════════════════════════════════════════════════
    SMALL COMPONENTS
    ═══════════════════════════════════════════════════════ */
@@ -7235,6 +7309,31 @@ function AssetWarroomTab({ isDark, privacy, active }) {
     );
   };
 
+  // ── 匯入資產配置 CSV：與匯出同格式，完全取代現有清單（同還原備份的語意）──
+  const awCsvInputRef = useRef(null);
+  const handleImportAssetsCSV = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rows = parseAssetsCSV(String(reader.result || ""));
+      if (!rows) {
+        openConfirm(
+          "匯入失敗",
+          "CSV 格式無法解析，請使用與「匯出 CSV」相同的欄位格式（類別、項目、輸入幣別、輸入市值、目標占比）。",
+          () => {}
+        );
+        return;
+      }
+      openConfirm(
+        "匯入 CSV",
+        `將以 CSV 內容（${rows.length} 項）完全取代現有 ${assets.length} 項資產。確定匯入？`,
+        () => {
+          setAssets(rows);
+        }
+      );
+    };
+    reader.readAsText(file, "utf-8");
+  };
+
   const exportCSV = () => {
     // 欄位加引號跳脫，名稱含逗號才不會讓欄位錯位
     const esc = (s) => `"${String(s).replace(/"/g, '""')}"`;
@@ -7565,6 +7664,17 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         </div>
       </div>
 
+      <input
+        type="file"
+        accept=".csv,text/csv"
+        ref={awCsvInputRef}
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0];
+          e.target.value = "";
+          if (f) handleImportAssetsCSV(f);
+        }}
+      />
       {/* ── Toolbar（狀態＋操作；主題/隱私由宿主控制）── */}
       <div className="aw-toolbar">
         <div
@@ -7626,6 +7736,14 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         </button>
         <button className="btn icon" onClick={handleReset} title="重置">
           <RotateCcw size={16} />
+        </button>
+        <button
+          className="btn"
+          onClick={() => awCsvInputRef.current && awCsvInputRef.current.click()}
+          title="與匯出相同格式；匯入後完全取代現有資產清單"
+        >
+          <Upload size={15} />
+          匯入 CSV
         </button>
         <button className="btn primary" onClick={exportCSV}>
           <Download size={15} />
@@ -7724,23 +7842,79 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                   </div>
                 )}
 
-              {/* ── Hero Card ── */}
-              <div className="hero-card animate-in" style={{ marginTop: 16 }}>
+              {/* ── Hero（瘦身版：拿掉獨立 App 大標題與文案，與宿主分頁的卡片語言一致）── */}
+              <div
+                className="hero-card animate-in"
+                style={{ marginTop: 16, padding: 24 }}
+              >
                 <div className="hero-grid">
-                  <div
-                    style={{
-                      display: "flex",
-                      flexDirection: "column",
-                      justifyContent: "space-between",
-                    }}
-                  >
-                    <div>
-                      <h2 className="hero-title">資產戰情室</h2>
-                      <p className="hero-desc">
-                        即時掌握總資產、配置偏離與月度變化，讓每一筆投資決策都有數據支撐。
-                      </p>
+                  <div className="hero-total-box">
+                    <div className="hero-total-label">
+                      Total Portfolio Value (TWD)
                     </div>
-                    <div className="hero-tags">
+                    <div className="hero-total-value">
+                      {maskMoney(formatCompact(totalValue))}
+                    </div>
+                    <div className="hero-total-sub">
+                      共 {assets.length} 項資產｜美元匯率 {refData.usdToTwd}
+                      ｜目標總占比 {totalTargetPercent.toFixed(1)}%
+                      {emergencyValue > 0 && (
+                        <>
+                          ｜緊急備用金{" "}
+                          {maskMoney(formatCompact(emergencyValue))}
+                        </>
+                      )}
+                    </div>
+                    <div className="hero-total-mini-grid">
+                      {[
+                        { label: "美元資產占比", value: `${usdAssetRatio}%` },
+                        { label: "現金占比", value: `${cashAssetRatio}%` },
+                      ].map((box, i) => (
+                        <div key={i} className="hero-total-mini">
+                          <div className="hero-total-mini-label">
+                            {box.label}
+                          </div>
+                          <div className="hero-total-mini-value">
+                            {box.value}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="hero-right">
+                    <div className="quick-insight">
+                      {[
+                        {
+                          label: "最大持倉",
+                          value: largestAsset ? largestAsset.name : "-",
+                        },
+                        {
+                          label: "偏離最大",
+                          value: highestTargetGap ? highestTargetGap.name : "-",
+                        },
+                        {
+                          label: "本月變化",
+                          value: latestSnapshotDelta
+                            ? `${
+                                latestSnapshotDelta.diff >= 0 ? "+" : ""
+                              }${latestSnapshotDelta.pct.toFixed(1)}%`
+                            : "-",
+                          cls: latestSnapshotDelta
+                            ? latestSnapshotDelta.diff >= 0
+                              ? "positive"
+                              : "negative"
+                            : "",
+                        },
+                      ].map((item, i) => (
+                        <div key={i} className="quick-card">
+                          <div className="quick-label">{item.label}</div>
+                          <div className={`quick-value ${item.cls || ""}`}>
+                            {item.value}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="hero-tags" style={{ marginTop: 0 }}>
                       {[
                         {
                           icon: <Wallet size={13} />,
@@ -7789,73 +7963,6 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                               未配置 {(100 - totalTargetPercent).toFixed(1)}%
                             </span>
                           )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="hero-right">
-                    <div className="hero-total-box">
-                      <div className="hero-total-label">
-                        Total Portfolio Value (TWD)
-                      </div>
-                      <div className="hero-total-value">
-                        {maskMoney(formatCompact(totalValue))}
-                      </div>
-                      <div className="hero-total-sub">
-                        共 {assets.length} 項資產｜美元匯率 {refData.usdToTwd}
-                        ｜目標總占比 {totalTargetPercent.toFixed(1)}%
-                        {emergencyValue > 0 && (
-                          <>
-                            ｜緊急備用金{" "}
-                            {maskMoney(formatCompact(emergencyValue))}
-                          </>
-                        )}
-                      </div>
-                      <div className="hero-total-mini-grid">
-                        {[
-                          { label: "美元資產占比", value: `${usdAssetRatio}%` },
-                          { label: "現金占比", value: `${cashAssetRatio}%` },
-                        ].map((box, i) => (
-                          <div key={i} className="hero-total-mini">
-                            <div className="hero-total-mini-label">
-                              {box.label}
-                            </div>
-                            <div className="hero-total-mini-value">
-                              {box.value}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="quick-insight">
-                      {[
-                        {
-                          label: "最大持倉",
-                          value: largestAsset ? largestAsset.name : "-",
-                        },
-                        {
-                          label: "偏離最大",
-                          value: highestTargetGap ? highestTargetGap.name : "-",
-                        },
-                        {
-                          label: "本月變化",
-                          value: latestSnapshotDelta
-                            ? `${
-                                latestSnapshotDelta.diff >= 0 ? "+" : ""
-                              }${latestSnapshotDelta.pct.toFixed(1)}%`
-                            : "-",
-                          cls: latestSnapshotDelta
-                            ? latestSnapshotDelta.diff >= 0
-                              ? "positive"
-                              : "negative"
-                            : "",
-                        },
-                      ].map((item, i) => (
-                        <div key={i} className="quick-card">
-                          <div className="quick-label">{item.label}</div>
-                          <div className={`quick-value ${item.cls || ""}`}>
-                            {item.value}
-                          </div>
                         </div>
                       ))}
                     </div>
