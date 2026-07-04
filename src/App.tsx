@@ -1069,6 +1069,9 @@ export default function App() {
   const jsonInputRef = useRef(null);
   const [fireInput, setFireInput] = useState("");
   const [fireExpense, setFireExpense] = useState(0);
+  // 退休後年收入（分紅、退休金等會持續的被動收入）：自由數字只需覆蓋「年支出−這筆」的缺口
+  const [firePassiveInput, setFirePassiveInput] = useState("");
+  const [firePassive, setFirePassive] = useState(0);
   const [hoveredMonth, setHoveredMonth] = useState(null);
   // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
   const [hmSel, setHmSel] = useState(null);
@@ -1129,6 +1132,7 @@ export default function App() {
     remoteJsonRef.current = JSON.stringify(normalizeRecords(records));
   const remoteGoalRef = useRef(0);
   const remoteFireRef = useRef(0);
+  const remotePassiveRef = useRef(0);
   const [formData, setFormData] = useState({
     month: getCurrentMonth(),
     totalAssets: "",
@@ -1201,6 +1205,13 @@ export default function App() {
                   setFireExpense(n);
                   remoteFireRef.current = n;
                 }
+                const fp = snap.data()?.firePassiveIncome;
+                if (fp != null) {
+                  const n = Number(fp) || 0;
+                  setFirePassiveInput(n ? String(n) : "");
+                  setFirePassive(n);
+                  remotePassiveRef.current = n;
+                }
                 setRecords((cur) => {
                   if (JSON.stringify(normalizeRecords(cur)) === rj) return cur;
                   persistLocal(recs);
@@ -1246,11 +1257,13 @@ export default function App() {
     const cn = normalizeRecords(records),
       cj = JSON.stringify(cn),
       cg = goalValue || 0,
-      cf = fireExpense || 0;
+      cf = fireExpense || 0,
+      cp = firePassive || 0;
     if (
       cj === remoteJsonRef.current &&
       cg === remoteGoalRef.current &&
-      cf === remoteFireRef.current
+      cf === remoteFireRef.current &&
+      cp === remotePassiveRef.current
     )
       return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -1263,6 +1276,7 @@ export default function App() {
             records: cn,
             goalValue: cg,
             fireExpense: cf,
+            firePassiveIncome: cp,
             updatedAt: serverTimestamp(),
             updatedAtClient: Date.now(),
             updatedBy: cloudUid || "anon",
@@ -1274,6 +1288,7 @@ export default function App() {
         remoteJsonRef.current = cj;
         remoteGoalRef.current = cg;
         remoteFireRef.current = cf;
+        remotePassiveRef.current = cp;
         setCloudState("已同步");
         setSaveStatus(`已同步 ${new Date().toLocaleTimeString("zh-TW")}`);
       } catch {
@@ -1283,7 +1298,15 @@ export default function App() {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [records, goalValue, fireExpense, authReady, cloudReady, cloudUid]);
+  }, [
+    records,
+    goalValue,
+    fireExpense,
+    firePassive,
+    authReady,
+    cloudReady,
+    cloudUid,
+  ]);
 
   const pd = useMemo(() => calcProcessed(records), [records]);
   const annualSummary = useMemo(() => getAnnualSummary(pd), [pd]);
@@ -1446,14 +1469,18 @@ export default function App() {
     const annual = (Math.pow(1 + mu / 100, 12) - 1) * 100;
     return annual > 10 ? { mu, annual } : null;
   }, [scenarioRate, scenarioDefaults]);
-  // FIRE：自由數字＝年支出 × (100/提領率)，達標門檻隨 2% 通膨逐月成長
-  //（名目資產 vs 今天的固定目標會系統性高估進度）；有負債時起點與進度用淨值
+  // FIRE：自由數字＝(年支出 − 退休後年收) × (100/提領率)，達標門檻隨 2% 通膨逐月成長。
+  // 退休後年收＝分紅、退休金等退休後仍會持續的被動收入，視為與通膨同步成長
+  //（固定名目金額的年金會略被高估）；有負債時起點與進度用淨值
   const fireStats = useMemo(() => {
     if (!fireExpense || fireExpense <= 0 || !latest) return null;
     const INFL = 0.02;
     const HORIZON = 600; // 最長推算 50 年：不再顯示「未達成」，一律給出實際落點
     const multiple = 100 / fireSwr;
-    const fireNumber = Math.round(fireExpense * multiple);
+    const passive = Math.max(0, firePassive || 0);
+    const netExpense = Math.max(0, fireExpense - passive);
+    const covered = netExpense <= 0; // 被動收入已覆蓋全部年支出
+    const fireNumber = Math.round(netExpense * multiple);
     const usesNetWorth = Number(latest.liabilities || 0) > 0;
     const base = usesNetWorth ? latest.netWorth : latest.totalAssets;
     const sim = projectScenarios(
@@ -1485,13 +1512,20 @@ export default function App() {
       multiple,
       usesNetWorth,
       base,
+      passive,
+      netExpense,
+      covered,
       reach,
       prob10y: probWithin(120),
       prob20y: probWithin(240),
-      progress: Math.min(100, Math.max(0, (base / fireNumber) * 100)),
+      progress:
+        fireNumber > 0
+          ? Math.min(100, Math.max(0, (base / fireNumber) * 100))
+          : 100,
     };
   }, [
     fireExpense,
+    firePassive,
     fireSwr,
     latest,
     pd,
@@ -1785,6 +1819,7 @@ export default function App() {
           records: n,
           goalValue: goalValue || 0,
           fireExpense: fireExpense || 0,
+          firePassiveIncome: firePassive || 0,
           updatedAt: serverTimestamp(),
           updatedAtClient: Date.now(),
           updatedBy: cloudUid || "anon",
@@ -1796,6 +1831,7 @@ export default function App() {
       remoteJsonRef.current = JSON.stringify(n);
       remoteGoalRef.current = goalValue || 0;
       remoteFireRef.current = fireExpense || 0;
+      remotePassiveRef.current = firePassive || 0;
       setCloudReady(true);
       remoteAppliedRef.current = true;
       setCloudState("已同步");
@@ -1877,6 +1913,7 @@ export default function App() {
       exportedAt: new Date().toISOString(),
       goalValue: goalValue || 0,
       fireExpense: fireExpense || 0,
+      firePassiveIncome: firePassive || 0,
       records: normalizeRecords(records),
       allocation,
     };
@@ -1926,6 +1963,10 @@ export default function App() {
             if (p.fireExpense) {
               setFireInput(String(p.fireExpense));
               setFireExpense(Number(p.fireExpense));
+            }
+            if (p.firePassiveIncome) {
+              setFirePassiveInput(String(p.firePassiveIncome));
+              setFirePassive(Number(p.firePassiveIncome));
             }
             // 資產配置：直接寫回其雲端文件，分頁的 onSnapshot 會即時同步
             if (p.allocation && Array.isArray(p.allocation.assets)) {
@@ -4297,7 +4338,7 @@ export default function App() {
                   財務自由（FIRE）
                 </h3>
                 <p className="card-desc">
-                  自由數字＝年支出 ×{" "}
+                  自由數字＝（年支出 − 退休後年收）×{" "}
                   {Number.isInteger(100 / fireSwr)
                     ? 100 / fireSwr
                     : (100 / fireSwr).toFixed(1)}
@@ -4361,8 +4402,32 @@ export default function App() {
                     }}
                   />
                 </div>
+                <div className="goal-input-wrap">
+                  <span className="goal-prefix mono">退休後年收 NT$</span>
+                  <MaskedNumInput
+                    privacy={privacy}
+                    value={firePassiveInput}
+                    placeholder="分紅、退休金等（選填）"
+                    ariaLabel="退休後年收入（退休後仍持續的被動收入）"
+                    onChange={(v) => {
+                      setFirePassiveInput(v);
+                      setFirePassive(Number(v) || 0);
+                    }}
+                  />
+                </div>
                 {fireStats ? (
                   <div className="goal-body">
+                    {fireStats.covered && (
+                      <div className="new-high-badge">
+                        退休後年收已覆蓋年支出，無需依賴投資組合 ✦
+                      </div>
+                    )}
+                    {fireStats.passive > 0 && !fireStats.covered && (
+                      <PRow
+                        l="組合需支應年支出"
+                        v={mask(`NT$ ${fmtN(fireStats.netExpense)}`)}
+                      />
+                    )}
                     <PRow
                       l={`自由數字（×${
                         Number.isInteger(fireStats.multiple)
