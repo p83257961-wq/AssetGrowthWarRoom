@@ -1075,6 +1075,8 @@ export default function App() {
   const [hoveredMonth, setHoveredMonth] = useState(null);
   // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
   const [hmSel, setHmSel] = useState(null);
+  // 備份提醒重算觸發器（下載備份／按「稍後」時 bump 讓橫幅立即更新）
+  const [backupPromptTick, setBackupPromptTick] = useState(0);
   // 預設淺色。key 升到 v2：舊 key 存的「dark」是初版自動寫入的預設值而非使用者選擇，
   // 沿用會讓改預設對既有裝置無效；v2 之後只記錄使用者實際切換的結果
   const [isDark, setIsDark] = useState(() => {
@@ -1712,6 +1714,21 @@ export default function App() {
       (new Date().getFullYear() - y) * 12 + (new Date().getMonth() - (m - 1));
     return d > 1 ? d : null;
   }, [latest]);
+  // 備份提醒：JSON 完整備份超過 60 天（或從未備份）時顯示橫幅；「稍後」暫緩 30 天。
+  // 雲端是共用文件不等於備份——本機留檔是資料災難的最後保險
+  const backupDue = useMemo(() => {
+    try {
+      const now = Date.now();
+      const snooze = Number(localStorage.getItem("agwr_backup_snooze") || 0);
+      if (now - snooze < 30 * 864e5) return null;
+      const last = Number(localStorage.getItem("agwr_last_backup") || 0);
+      if (!last) return { never: true };
+      const days = Math.floor((now - last) / 864e5);
+      return days >= 60 ? { days } : null;
+    } catch {
+      return null;
+    }
+  }, [backupPromptTick]);
   const insightMsg = useMemo(() => {
     if (!latest) return "尚未建立資料。";
     if (gapWarning)
@@ -1768,6 +1785,21 @@ export default function App() {
       note: formData.note || "",
     };
     const ex = records.some((r) => r.month === c.month);
+    // 胖手指防呆：與前一個月比，總資產變動超過 ±40% 視為可疑（多打／少打一位數）。
+    // 只警示不阻擋——大額進出是真實會發生的事
+    const prevRec = [...records]
+      .filter((r) => r.month < c.month)
+      .sort((a, b) => a.month.localeCompare(b.month))
+      .pop();
+    const prevTotal = prevRec ? Number(prevRec.totalAssets) : 0;
+    const changePct =
+      prevTotal > 0 ? ((c.totalAssets - prevTotal) / prevTotal) * 100 : 0;
+    const fatFingerMsg =
+      prevTotal > 0 && Math.abs(changePct) > 40
+        ? `注意：總資產較上月（${mask(fmtN(prevTotal))}）變動 ${
+            changePct >= 0 ? "+" : ""
+          }${changePct.toFixed(0)}%，請確認沒有多打或少打數字。`
+        : "";
     // 編輯中改了月份：明確詢問「移動」或「另存」。
     // 原本會默默新增一筆、舊月份紀錄還留著，使用者以為是搬移，結果多出重複資料
     if (editingMonth && editingMonth !== c.month) {
@@ -1775,7 +1807,7 @@ export default function App() {
         title: "月份已變更",
         message: `正在編輯 ${editingMonth}，月份已改為 ${c.month}。「移動」會刪除 ${editingMonth} 的原紀錄${
           ex ? `並覆蓋 ${c.month} 現有資料` : ""
-        }；「另存」則保留原紀錄、另外新增一筆。`,
+        }；「另存」則保留原紀錄、另外新增一筆。${fatFingerMsg}`,
         confirmLabel: "移動",
         secondaryLabel: "另存",
         onConfirm: () => {
@@ -1797,8 +1829,17 @@ export default function App() {
     if (ex && !editingMonth) {
       setConfirmDlg({
         title: "覆蓋紀錄",
-        message: `${c.month} 已有資料，確定要覆蓋嗎？原數值將被取代。`,
+        message: `${c.month} 已有資料，確定要覆蓋嗎？原數值將被取代。${fatFingerMsg}`,
         onConfirm: () => applySave(c, true),
+      });
+      return;
+    }
+    if (fatFingerMsg) {
+      setConfirmDlg({
+        title: "數字變動異常",
+        message: `${fatFingerMsg}確定要儲存嗎？`,
+        confirmLabel: "確定儲存",
+        onConfirm: () => applySave(c, ex),
       });
       return;
     }
@@ -1931,6 +1972,11 @@ export default function App() {
     document.body.removeChild(a);
     URL.revokeObjectURL(u);
     setToast("備份已下載");
+    // 記錄備份時間供提醒橫幅判斷
+    try {
+      localStorage.setItem("agwr_last_backup", String(Date.now()));
+    } catch {}
+    setBackupPromptTick((t) => t + 1);
   };
   const handleRestoreJSON = (file) => {
     const reader = new FileReader();
@@ -2508,6 +2554,34 @@ export default function App() {
                 }}
               >
                 立即補登
+              </button>
+            </div>
+          )}
+          {backupDue && (
+            <div className="stale-banner si si-0" role="status">
+              <Save size={15} />
+              <span>
+                {backupDue.never
+                  ? "尚未下載過 JSON 完整備份——雲端不等於備份，手上留一份才安全。"
+                  : `距上次完整備份已 ${backupDue.days} 天，建議更新一份。`}
+              </span>
+              <button className="btn-ghost" onClick={downloadBackup}>
+                立即備份
+              </button>
+              <button
+                className="btn-ghost"
+                style={{ marginLeft: 0 }}
+                onClick={() => {
+                  try {
+                    localStorage.setItem(
+                      "agwr_backup_snooze",
+                      String(Date.now())
+                    );
+                  } catch {}
+                  setBackupPromptTick((t) => t + 1);
+                }}
+              >
+                30 天後再提醒
               </button>
             </div>
           )}
