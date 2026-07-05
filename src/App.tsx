@@ -4699,6 +4699,48 @@ export default function App() {
                 ))}
               </div>
             </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginBottom: 14,
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 12,
+                  color: T.textTertiary,
+                  fontWeight: 600,
+                }}
+              >
+                年支出快選
+              </span>
+              <div className="seg-group">
+                {[
+                  { v: 6000000, label: "低 600萬" },
+                  { v: 10000000, label: "中 1000萬" },
+                  { v: 15000000, label: "高 1500萬" },
+                ].map((o) => (
+                  <button
+                    key={o.v}
+                    className={`seg-btn ${
+                      fireExpense === o.v ? "active" : ""
+                    }`}
+                    onClick={() => {
+                      setFireInput(String(o.v));
+                      setFireExpense(o.v);
+                    }}
+                    title={`年支出 NT$ ${fmtN(o.v)}（月支出約 ${fmtS(
+                      o.v / 12
+                    )}）`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             {fireStats && fireMuWarn && (
               <div
                 className="alert alert-warn"
