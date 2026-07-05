@@ -4667,7 +4667,7 @@ export default function App() {
             </div>
           </section>
           <section className="card si si-4">
-            <div className="chart-header">
+            <div className="chart-header" style={{ marginBottom: 2 }}>
               <div>
                 <h3 className="card-title">
                   <Banknote size={18} className="icon-gold" />
@@ -4687,7 +4687,7 @@ export default function App() {
                   display: "flex",
                   flexDirection: "column",
                   alignItems: "flex-end",
-                  gap: 8,
+                  gap: 6,
                 }}
               >
                 <div className="seg-group">
