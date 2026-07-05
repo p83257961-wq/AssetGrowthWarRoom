@@ -4090,6 +4090,8 @@ export default function App() {
                 <option value={36}>36M</option>
                 <option value={60}>60M（5年）</option>
                 <option value={120}>120M（10年）</option>
+                <option value={180}>180M（15年）</option>
+                <option value={240}>240M（20年）</option>
               </select>
             </div>
             <div className="assumption-bar si si-1">
