@@ -766,6 +766,44 @@ function downloadCSV(r) {
   document.body.removeChild(a);
   URL.revokeObjectURL(u);
 }
+/* 破壞性操作（匯入／還原／重置／清空）前自動下載當前狀態備份：按錯永遠有後悔藥。
+   直接從 localStorage 組檔，主 App 與資產配置分頁都能呼叫，不依賴元件 state */
+function downloadPreActionBackup(tag) {
+  try {
+    let records = [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) records = JSON.parse(raw).records || [];
+    } catch {}
+    let allocation = null;
+    try {
+      const awRaw = localStorage.getItem(AW_STORAGE_KEY);
+      if (awRaw) allocation = JSON.parse(awRaw);
+    } catch {}
+    const payload = {
+      app: "asset-growth-war-room",
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      autoBackupBefore: tag,
+      records,
+      allocation,
+    };
+    const b = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = u;
+    a.download = `auto-backup-before-${tag}-${new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[T:]/g, "")}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(u);
+  } catch {}
+}
 /* hex 轉 rgba（熱力圖依報酬強度調透明度用） */
 function hexA(hex, a) {
   const h = String(hex).replace("#", "");
@@ -902,7 +940,18 @@ function getScenarioStats(pd) {
   const std = Math.sqrt(
     rets.reduce((s, r) => s + (r - avg) ** 2, 0) / (rets.length || 1)
   );
-  const avgIn = l12.reduce((a, r) => a + r.netCashFlow, 0) / (l12.length || 1);
+  // 月均投入：剔除大額單月（|淨現金流| 超過中位數 4 倍、且大於 30 萬）——
+  // 貸款入金、賣房、年終等一次性事件不該被外推成「每個月都會發生」
+  const flows = l12.map((r) => Number(r.netCashFlow || 0));
+  const sortedAbs = flows.map(Math.abs).sort((a, b) => a - b);
+  const medAbs = sortedAbs.length
+    ? sortedAbs[Math.floor(sortedAbs.length / 2)]
+    : 0;
+  const isExtremeFlow = (f) => Math.abs(f) > Math.max(medAbs * 4, 300000);
+  const normalFlows = flows.filter((f) => !isExtremeFlow(f));
+  const flowBasis = normalFlows.length >= 6 ? normalFlows : flows;
+  const avgIn = flowBasis.reduce((a, b) => a + b, 0) / (flowBasis.length || 1);
+  const excludedFlowMonths = flows.length - flowBasis.length;
   // 投入年增率自動推估：近 12 個月 vs 再前 12 個月的平均投入相比。
   // 需至少 24 個月資料；限制 0~10%、負值歸 0（一次性提領或大額投入會污染長期外推，
   // 手動滑桿永遠優先——調薪幅度是使用者自己最清楚的資訊）
@@ -921,6 +970,7 @@ function getScenarioStats(pd) {
     avgReturn: avg * 100,
     sigma: std * 100,
     avgInflow: avgIn,
+    excludedFlowMonths,
     inflowGrowth,
     inflowGrowthEstimated,
     sampleMonths: basis.length,
@@ -937,7 +987,8 @@ function projectScenarios(
   customRate = null,
   customInflow = null,
   customSigma = null,
-  inflowGrowthPct = null
+  inflowGrowthPct = null,
+  events = []
 ) {
   const st = getScenarioStats(pd);
   const mean = customRate !== null ? customRate / 100 : st.avgReturn / 100;
@@ -948,6 +999,12 @@ function projectScenarios(
   const inflows = [];
   for (let i = 1; i <= months; i++)
     inflows.push(inflow * Math.pow(1 + growth / 100, (i - 1) / 12));
+  // 一次性事件：第 month 個月加上 amount（正＝入金、負＝支出），同月多筆累加
+  const evMap = {};
+  (events || []).forEach((e) => {
+    if (e && e.month >= 1 && e.month <= months)
+      evMap[e.month] = (evMap[e.month] || 0) + Number(e.amount || 0);
+  });
   const N = 500;
   const rng = mulberry32(20260702);
   const randn = makeRandn(rng);
@@ -956,7 +1013,7 @@ function projectScenarios(
     let v = cur;
     const pts = [v];
     for (let i = 1; i <= months; i++) {
-      v = v * (1 + mean + sigma * randn()) + inflows[i - 1];
+      v = v * (1 + mean + sigma * randn()) + inflows[i - 1] + (evMap[i] || 0);
       v = Math.max(0, v);
       pts.push(v);
     }
@@ -1060,6 +1117,8 @@ export default function App() {
   const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
   const debScenarioSigma = useDebouncedValue(scenarioSigma, 150);
   const debScenarioInflowGrowth = useDebouncedValue(scenarioInflowGrowth, 150);
+  // 一次性事件（信貸入金＋／頭期款支出−）：session 內有效，輸入存字串以便清空
+  const [scenarioEvents, setScenarioEvents] = useState([]);
   const [animTab, setAnimTab] = useState(activeTab);
   const visitedTabsRef = useRef(null);
   if (visitedTabsRef.current === null)
@@ -1335,6 +1394,23 @@ export default function App() {
     const t = basisPd.length;
     return t ? (basisPd.filter((r) => r.returnRate > 0).length / t) * 100 : 0;
   }, [basisPd]);
+  // 有效事件：月份 1~600、金額非零才進模擬（輸入框內的半成品不觸發重算）
+  const activeEvents = useMemo(
+    () =>
+      scenarioEvents
+        .map((e) => ({
+          month: Math.round(Number(e.month)),
+          amount: Number(e.amount),
+        }))
+        .filter(
+          (e) =>
+            e.month >= 1 &&
+            e.month <= 600 &&
+            Number.isFinite(e.amount) &&
+            e.amount !== 0
+        ),
+    [scenarioEvents]
+  );
   const scenarioSim = useMemo(
     () =>
       latest
@@ -1345,7 +1421,8 @@ export default function App() {
             debScenarioRate,
             debScenarioInflow,
             debScenarioSigma,
-            debScenarioInflowGrowth
+            debScenarioInflowGrowth,
+            activeEvents
           )
         : null,
     [
@@ -1356,6 +1433,7 @@ export default function App() {
       debScenarioInflow,
       debScenarioSigma,
       debScenarioInflowGrowth,
+      activeEvents,
     ]
   );
   const scenarios = scenarioSim ? scenarioSim.scenarios : [];
@@ -1492,7 +1570,8 @@ export default function App() {
       debScenarioRate,
       debScenarioInflow,
       debScenarioSigma,
-      debScenarioInflowGrowth
+      debScenarioInflowGrowth,
+      activeEvents
     );
     const targetAt = (i) => fireNumber * Math.pow(1 + INFL, i / 12);
     const reach = sim.scenarios.map((s) => ({
@@ -1535,6 +1614,7 @@ export default function App() {
     debScenarioInflow,
     debScenarioSigma,
     debScenarioInflowGrowth,
+    activeEvents,
   ]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
@@ -1930,8 +2010,9 @@ export default function App() {
         title: "匯入 CSV",
         message: `將匯入 ${rows.length} 筆（${rows[0].month} ~ ${
           rows[rows.length - 1].month
-        }），其中 ${dup} 筆與現有月份重複、將被覆蓋。`,
+        }），其中 ${dup} 筆與現有月份重複、將被覆蓋。執行前會自動下載一份當前備份。`,
         onConfirm: () => {
+          downloadPreActionBackup("csv-import");
           setRecords((p) => {
             const m = new Map(p.map((r) => [r.month, r]));
             rows.forEach((r) => m.set(r.month, r));
@@ -1999,8 +2080,9 @@ export default function App() {
             p.allocation && Array.isArray(p.allocation.assets)
               ? `資產配置（${p.allocation.assets.length} 項）也會一併還原。`
               : ""
-          }`,
+          }執行前會自動下載一份當前備份。`,
           onConfirm: async () => {
+            downloadPreActionBackup("restore");
             setRecords(recs);
             if (p.goalValue) {
               setGoalValue(Number(p.goalValue));
@@ -4021,6 +4103,9 @@ export default function App() {
                 {annualizePct(scenarioDefaults.avgReturn).toFixed(1)}%）・σ{" "}
                 {scenarioDefaults.sigma.toFixed(1)}%｜月均投入{" "}
                 {mask(`NT$ ${fmtN(Math.round(scenarioDefaults.avgInflow))}`)}
+                {scenarioDefaults.excludedFlowMonths > 0
+                  ? `（已剔除 ${scenarioDefaults.excludedFlowMonths} 個大額單月）`
+                  : ""}
                 ・年增{" "}
                 {scenarioDefaults.inflowGrowthEstimated
                   ? `${scenarioDefaults.inflowGrowth.toFixed(1)}%`
@@ -4213,6 +4298,150 @@ export default function App() {
                 )}
               </div>
             </div>
+            <div
+              className="si si-2"
+              style={{
+                background: T.surfaceInset,
+                border: `1px solid ${T.border}`,
+                borderRadius: 12,
+                padding: "14px 16px",
+                marginBottom: 16,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: T.textSecondary,
+                  }}
+                >
+                  一次性事件（正＝入金：信貸、獎金／負＝支出：頭期款）
+                </span>
+                <button
+                  className="btn-reset-sm"
+                  style={{ marginLeft: "auto" }}
+                  disabled={scenarioEvents.length >= 5}
+                  onClick={() =>
+                    setScenarioEvents((p) =>
+                      p.length >= 5
+                        ? p
+                        : [...p, { id: generateId(), month: "12", amount: "" }]
+                    )
+                  }
+                >
+                  ＋ 新增事件
+                </button>
+              </div>
+              {scenarioEvents.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                    marginTop: 10,
+                  }}
+                >
+                  {scenarioEvents.map((ev) => (
+                    <div
+                      key={ev.id}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: T.textTertiary }}>
+                        第
+                      </span>
+                      <input
+                        className="field-input mono"
+                        type="number"
+                        min="1"
+                        max="600"
+                        style={{ width: 76, padding: "6px 10px" }}
+                        value={ev.month}
+                        aria-label="事件發生於第幾個月"
+                        onChange={(e) =>
+                          setScenarioEvents((p) =>
+                            p.map((x) =>
+                              x.id === ev.id
+                                ? { ...x, month: e.target.value }
+                                : x
+                            )
+                          )
+                        }
+                      />
+                      <span style={{ fontSize: 12, color: T.textTertiary }}>
+                        個月
+                        {latest && Number(ev.month) >= 1
+                          ? `（${addMonths(
+                              latest.month,
+                              Math.round(Number(ev.month))
+                            )}）`
+                          : ""}
+                        ，金額
+                      </span>
+                      <input
+                        className="field-input mono"
+                        type="number"
+                        placeholder="+入金 / -支出"
+                        style={{ width: 150, padding: "6px 10px" }}
+                        value={ev.amount}
+                        aria-label="事件金額，正為入金、負為支出"
+                        onChange={(e) =>
+                          setScenarioEvents((p) =>
+                            p.map((x) =>
+                              x.id === ev.id
+                                ? { ...x, amount: e.target.value }
+                                : x
+                            )
+                          )
+                        }
+                      />
+                      {Number(ev.amount) ? (
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 600,
+                            color:
+                              Number(ev.amount) >= 0 ? T.positive : T.negative,
+                          }}
+                        >
+                          {Number(ev.amount) >= 0 ? "入金 " : "支出 "}
+                          {mask(fmtS(Math.abs(Number(ev.amount))))}
+                        </span>
+                      ) : null}
+                      <button
+                        className="icon-btn"
+                        title="移除事件"
+                        aria-label="移除此事件"
+                        onClick={() =>
+                          setScenarioEvents((p) =>
+                            p.filter((x) => x.id !== ev.id)
+                          )
+                        }
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 11, color: T.textTertiary }}>
+                    事件同時套用到下方情境模擬與 FIRE
+                    推算。貸款入金後記得把「月均投入」滑桿調低對應的月還款額。
+                  </div>
+                </div>
+              )}
+            </div>
             <div className="scenario-summary si si-2">
               {scenarios.map((s) => {
                 const delta = s.finalValue - stats.totalAssets;
@@ -4403,6 +4632,26 @@ export default function App() {
                       }}
                     />
                   )}
+                  {latest &&
+                    activeEvents
+                      .filter((ev) => ev.month <= scenarioMonths)
+                      .map((ev, i) => (
+                        <ReferenceLine
+                          key={`ev-${i}`}
+                          x={fmtMS(addMonths(latest.month, ev.month))}
+                          stroke={ev.amount >= 0 ? T.positive : T.negative}
+                          strokeDasharray="4 3"
+                          label={{
+                            value: mask(
+                              `${ev.amount >= 0 ? "+" : "-"}${fmtS(
+                                Math.abs(ev.amount)
+                              )}`
+                            ),
+                            fill: ev.amount >= 0 ? T.positive : T.negative,
+                            fontSize: 10,
+                          }}
+                        />
+                      ))}
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -7289,8 +7538,9 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   const handleReset = async () => {
     openConfirm(
       "確認重置",
-      "確定要重置成預設資料嗎？目前資料、排序與快照都會被清除。",
+      "確定要重置成預設資料嗎？目前資料、排序與快照都會被清除，執行前會自動下載一份當前備份。",
       async () => {
+        downloadPreActionBackup("reset");
         const r = {
           assets: normalizeAssets(INITIAL_DATA),
           refData: INITIAL_REF_DATA,
@@ -7339,8 +7589,9 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       }
       openConfirm(
         "匯入 CSV",
-        `將以 CSV 內容（${rows.length} 項）完全取代現有 ${assets.length} 項資產。確定匯入？`,
+        `將以 CSV 內容（${rows.length} 項）完全取代現有 ${assets.length} 項資產，執行前會自動下載一份當前備份。確定匯入？`,
         () => {
+          downloadPreActionBackup("aw-csv-import");
           setAssets(rows);
         }
       );
@@ -7470,8 +7721,13 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   };
 
   const clearSnapshots = () =>
-    openConfirm("清空紀錄", "確定要清空所有月度紀錄嗎？此動作無法復原。", () =>
-      setSnapshots([])
+    openConfirm(
+      "清空紀錄",
+      "確定要清空所有月度紀錄嗎？執行前會自動下載一份當前備份。",
+      () => {
+        downloadPreActionBackup("clear-snapshots");
+        setSnapshots([]);
+      }
     );
 
 
