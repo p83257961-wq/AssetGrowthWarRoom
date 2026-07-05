@@ -4682,53 +4682,66 @@ export default function App() {
                   50 年，有負債時以淨值計算。
                 </p>
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "flex-end",
-                  gap: 6,
-                }}
-              >
-                <div className="seg-group">
-                  {[
-                    { v: 4, label: "4% 經典" },
-                    { v: 3.5, label: "3.5%" },
-                    { v: 3.25, label: "3.25% 保守" },
-                  ].map((o) => (
-                    <button
-                      key={o.v}
-                      className={`seg-btn ${fireSwr === o.v ? "active" : ""}`}
-                      onClick={() => setFireSwr(o.v)}
-                      title={`提領率 ${o.v}%＝年支出 × ${(100 / o.v).toFixed(1)}`}
-                    >
-                      {o.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="seg-group">
-                  {[
-                    { v: 6000000, label: "低 600萬" },
-                    { v: 10000000, label: "中 1000萬" },
-                    { v: 15000000, label: "高 1500萬" },
-                  ].map((o) => (
-                    <button
-                      key={o.v}
-                      className={`seg-btn ${
-                        fireExpense === o.v ? "active" : ""
-                      }`}
-                      onClick={() => {
-                        setFireInput(String(o.v));
-                        setFireExpense(o.v);
-                      }}
-                      title={`年支出 NT$ ${fmtN(o.v)}（月支出約 ${fmtS(
-                        o.v / 12
-                      )}）`}
-                    >
-                      {o.label}
-                    </button>
-                  ))}
-                </div>
+              <div className="seg-group">
+                {[
+                  { v: 4, label: "4% 經典" },
+                  { v: 3.5, label: "3.5%" },
+                  { v: 3.25, label: "3.25% 保守" },
+                ].map((o) => (
+                  <button
+                    key={o.v}
+                    className={`seg-btn ${fireSwr === o.v ? "active" : ""}`}
+                    onClick={() => setFireSwr(o.v)}
+                    title={`提領率 ${o.v}%＝年支出 × ${(100 / o.v).toFixed(1)}`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <div className="goal-input-wrap" style={{ flex: "1 1 260px" }}>
+                <span className="goal-prefix mono">年支出 NT$</span>
+                <MaskedNumInput
+                  privacy={privacy}
+                  value={fireInput}
+                  placeholder="例如 600000"
+                  ariaLabel="年支出"
+                  onChange={(v) => {
+                    setFireInput(v);
+                    setFireExpense(Number(v) || 0);
+                  }}
+                />
+              </div>
+              <div className="seg-group">
+                {[
+                  { v: 6000000, label: "低 600萬" },
+                  { v: 10000000, label: "中 1000萬" },
+                  { v: 15000000, label: "高 1500萬" },
+                ].map((o) => (
+                  <button
+                    key={o.v}
+                    className={`seg-btn ${
+                      fireExpense === o.v ? "active" : ""
+                    }`}
+                    onClick={() => {
+                      setFireInput(String(o.v));
+                      setFireExpense(o.v);
+                    }}
+                    title={`年支出 NT$ ${fmtN(o.v)}（月支出約 ${fmtS(
+                      o.v / 12
+                    )}）`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
               </div>
             </div>
             {fireStats && fireMuWarn && (
@@ -4755,21 +4768,8 @@ export default function App() {
                 </button>
               </div>
             )}
-            <div className="fire-grid">
+            <div className="fire-grid" style={{ marginTop: 0 }}>
               <div>
-                <div className="goal-input-wrap">
-                  <span className="goal-prefix mono">年支出 NT$</span>
-                  <MaskedNumInput
-                    privacy={privacy}
-                    value={fireInput}
-                    placeholder="例如 600000"
-                    ariaLabel="年支出"
-                    onChange={(v) => {
-                      setFireInput(v);
-                      setFireExpense(Number(v) || 0);
-                    }}
-                  />
-                </div>
                 <div className="goal-input-wrap">
                   <span className="goal-prefix mono">退休後年收 NT$</span>
                   <MaskedNumInput
