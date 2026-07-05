@@ -4860,39 +4860,159 @@ export default function App() {
               </div>
               <div className="fire-reach">
                 {fireStats && latest ? (
-                  fireStats.reach.map((r) => {
-                    const c = {
-                      bull: T.positive,
-                      base: T.gold,
-                      bear: T.negative,
-                    }[r.key];
-                    let label;
-                    if (r.idx === 0) label = "已達成 ✦";
-                    else if (r.idx < 0) label = "超過 50 年（模擬上限）";
-                    else {
-                      const yy = Math.floor(r.idx / 12),
-                        mm = r.idx % 12,
-                        parts = [];
-                      if (yy) parts.push(`${yy} 年`);
-                      if (mm) parts.push(`${mm} 個月`);
-                      label = `${parts.join(" ")}後（${addMonths(
-                        latest.month,
-                        r.idx
-                      )}）`;
-                    }
-                    return (
-                      <div key={r.key} className="a-row">
-                        <span className="a-row-l">
-                          <span
-                            className="ct-dot"
-                            style={{ background: c }}
-                          />
-                          {r.label}
+                  <>
+                    <div
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        letterSpacing: "0.08em",
+                        textTransform: "uppercase",
+                        color: T.textTertiary,
+                        marginBottom: 10,
+                      }}
+                    >
+                      三情境達成時間
+                    </div>
+                    {!fireStats.covered && (
+                      <div
+                        style={{
+                          position: "relative",
+                          height: 32,
+                          marginBottom: 12,
+                        }}
+                      >
+                        <span
+                          style={{
+                            position: "absolute",
+                            top: 0,
+                            left: 0,
+                            fontSize: 9,
+                            color: T.textTertiary,
+                          }}
+                        >
+                          今
                         </span>
-                        <span className="a-row-v mono">{label}</span>
+                        <span
+                          style={{
+                            position: "absolute",
+                            top: 0,
+                            right: 0,
+                            fontSize: 9,
+                            color: T.textTertiary,
+                          }}
+                        >
+                          50 年
+                        </span>
+                        <div
+                          style={{
+                            position: "absolute",
+                            top: 16,
+                            left: 0,
+                            right: 0,
+                            height: 4,
+                            borderRadius: 999,
+                            background: T.surfaceInset,
+                            border: `1px solid ${T.border}`,
+                          }}
+                        />
+                        {fireStats.reach.map((r) => {
+                          const dotC = {
+                            bull: T.positive,
+                            base: T.gold,
+                            bear: T.negative,
+                          }[r.key];
+                          const pos =
+                            r.idx === 0
+                              ? 0
+                              : r.idx < 0
+                              ? 100
+                              : Math.min(100, (r.idx / 600) * 100);
+                          return (
+                            <span
+                              key={r.key}
+                              title={`${r.label}：${
+                                r.idx < 0
+                                  ? "超過 50 年"
+                                  : r.idx === 0
+                                  ? "已達成"
+                                  : `約 ${(r.idx / 12).toFixed(1)} 年`
+                              }`}
+                              style={{
+                                position: "absolute",
+                                top: 12,
+                                left: `${pos}%`,
+                                transform: "translateX(-50%)",
+                                width: 12,
+                                height: 12,
+                                borderRadius: "50%",
+                                background: dotC,
+                                border: `2px solid ${T.surface}`,
+                                boxShadow: `0 0 0 1px ${T.border}`,
+                                opacity: r.idx < 0 ? 0.35 : 1,
+                              }}
+                            />
+                          );
+                        })}
                       </div>
-                    );
-                  })
+                    )}
+                    {fireStats.reach.map((r) => {
+                      const c = {
+                        bull: T.positive,
+                        base: T.gold,
+                        bear: T.negative,
+                      }[r.key];
+                      let label;
+                      if (r.idx === 0) label = "已達成 ✦";
+                      else if (r.idx < 0) label = "超過 50 年（模擬上限）";
+                      else {
+                        const yy = Math.floor(r.idx / 12),
+                          mm = r.idx % 12,
+                          parts = [];
+                        if (yy) parts.push(`${yy} 年`);
+                        if (mm) parts.push(`${mm} 個月`);
+                        label = `${parts.join(" ")}後（${addMonths(
+                          latest.month,
+                          r.idx
+                        )}）`;
+                      }
+                      return (
+                        <div key={r.key} className="a-row">
+                          <span className="a-row-l">
+                            <span
+                              className="ct-dot"
+                              style={{ background: c }}
+                            />
+                            {r.label}
+                          </span>
+                          <span className="a-row-v mono">{label}</span>
+                        </div>
+                      );
+                    })}
+                    {(() => {
+                      const b = fireStats.reach.find((r) => r.key === "base");
+                      if (!b || b.idx <= 0 || fireStats.covered) return null;
+                      const factor = Math.pow(1.02, b.idx / 12);
+                      return (
+                        <div
+                          style={{
+                            marginTop: 12,
+                            fontSize: 11,
+                            color: T.textTertiary,
+                            lineHeight: 1.7,
+                          }}
+                        >
+                          基準情境抵達時，自由數字已隨 2% 通膨長成約{" "}
+                          {mask(
+                            `NT$ ${fmtN(
+                              Math.round(fireStats.fireNumber * factor)
+                            )}`
+                          )}
+                          （較今日 +{((factor - 1) * 100).toFixed(0)}
+                          %）——達成時間已把這個成長算進去。
+                        </div>
+                      );
+                    })()}
+                  </>
                 ) : (
                   <div className="preview-empty">—</div>
                 )}
