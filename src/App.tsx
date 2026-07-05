@@ -4703,11 +4703,15 @@ export default function App() {
               style={{
                 display: "flex",
                 alignItems: "center",
+                justifyContent: "space-between",
                 gap: 12,
                 flexWrap: "wrap",
               }}
             >
-              <div className="goal-input-wrap" style={{ flex: "1 1 260px" }}>
+              <div
+                className="goal-input-wrap"
+                style={{ flex: "0 1 calc(50% - 12px)", minWidth: 240 }}
+              >
                 <span className="goal-prefix mono">年支出 NT$</span>
                 <MaskedNumInput
                   privacy={privacy}
