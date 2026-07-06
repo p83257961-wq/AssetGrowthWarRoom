@@ -5501,6 +5501,8 @@ table{border-collapse:collapse}
 .goal-body{display:flex;flex-direction:column;gap:8px}
 .progress-track{height:5px;background:${T.surfaceInset};border-radius:999px;overflow:hidden}
 .progress-fill{height:100%;border-radius:999px;transition:width 0.6s cubic-bezier(0.16,1,0.3,1)}
+input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .goal-meta{display:flex;justify-content:space-between;font-size:13px}
 .goal-rows{display:flex;flex-direction:column;gap:6px;margin-top:4px}
 
