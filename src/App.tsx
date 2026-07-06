@@ -5393,7 +5393,6 @@ body{transition:background 0.3s ease,color 0.3s ease;font-family:'DM Sans',-appl
 button,input,select{font:inherit}
 table{border-collapse:collapse}
 .mono{font-family:'DM Mono','SF Mono','Fira Code',Menlo,Consolas,monospace;letter-spacing:-0.01em;font-variant-numeric:tabular-nums}
-[title]{cursor:help}
 
 @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 @keyframes staggerIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
