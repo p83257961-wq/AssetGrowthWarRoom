@@ -1381,29 +1381,6 @@ export default function App() {
     gfb.firePassive ? String(gfb.firePassive) : ""
   );
   const [firePassive, setFirePassive] = useState(gfb.firePassive);
-  // 支出加成係數（稅／二代健保）：退休提領的毛額高於生活費淨額，
-  // 預設 1.0 不加成；限 1~2 之外的輸入視為未設定，避免打錯字讓自由數字爆掉
-  const [fireTaxInput, setFireTaxInput] = useState(() => {
-    try {
-      const v = Number(localStorage.getItem("agwr_fire_tax"));
-      return v > 1 && v <= 2 ? String(v) : "";
-    } catch {
-      return "";
-    }
-  });
-  const [fireTaxFactor, setFireTaxFactor] = useState(() => {
-    try {
-      const v = Number(localStorage.getItem("agwr_fire_tax"));
-      return v > 1 && v <= 2 ? v : 1;
-    } catch {
-      return 1;
-    }
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem("agwr_fire_tax", String(fireTaxFactor));
-    } catch {}
-  }, [fireTaxFactor]);
   const [hoveredMonth, setHoveredMonth] = useState(null);
   // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
   const [hmSel, setHmSel] = useState(null);
@@ -1496,8 +1473,6 @@ export default function App() {
   const remoteGoalRef = useRef(gfb.goalValue);
   const remoteFireRef = useRef(gfb.fireExpense);
   const remotePassiveRef = useRef(gfb.firePassive);
-  // 稅費係數同理：初值對齊 agwr_fire_tax 載入的 state 初值
-  const remoteTaxRef = useRef(fireTaxFactor);
   // 一次性事件的回音守衛以正規化 JSON 比對（陣列無法用 === 比對）；
   // lazy init：stringify 只在首次 render 執行一次，初值對齊 agwr_scenario_events 載入值
   const remoteEventsRef = useRef(null);
@@ -1509,7 +1484,6 @@ export default function App() {
   const localGoalRef = useRef(gfb.goalValue);
   const localFireRef = useRef(gfb.fireExpense);
   const localPassiveRef = useRef(gfb.firePassive);
-  const localTaxRef = useRef(fireTaxFactor);
   const localEventsRef = useRef(remoteEventsRef.current);
   // 範例資料偵測：與內建 INITIAL_RECORDS 逐筆相同才成立，任何一筆被修改即視為使用者資料。
   // 比照資產配置分頁 isExampleData 的作法，避免新使用者把範例當成自己（或別人）的真實資產
@@ -1556,11 +1530,8 @@ export default function App() {
       );
     } catch {}
   }, [goalValue, fireExpense, firePassive]);
-  // 稅費係數／一次性事件的鏡射：供 snapshot 閉包做 pending 回音守衛比對；
-  // 本機備援分別由 agwr_fire_tax、agwr_scenario_events 的 effect 負責，這裡不重複寫入
-  useEffect(() => {
-    localTaxRef.current = fireTaxFactor || 1;
-  }, [fireTaxFactor]);
+  // 一次性事件的鏡射：供 snapshot 閉包做 pending 回音守衛比對；
+  // 本機備援由 agwr_scenario_events 的 effect 負責，這裡不重複寫入
   useEffect(() => {
     localEventsRef.current = JSON.stringify(
       normalizeScenarioEvents(scenarioEvents)
@@ -1636,17 +1607,6 @@ export default function App() {
                     setFirePassive(n);
                   }
                   remotePassiveRef.current = n;
-                }
-                const rt = snap.data()?.fireTaxFactor;
-                if (rt != null) {
-                  const n = Number(rt);
-                  const f = n > 1 && n <= 2 ? n : 1;
-                  // 比照 goalValue：本地有 pending 變更時不套用遠端，只更新基準待補傳
-                  if (localTaxRef.current === remoteTaxRef.current) {
-                    setFireTaxInput(f > 1 ? String(f) : "");
-                    setFireTaxFactor(f);
-                  }
-                  remoteTaxRef.current = f;
                 }
                 const se = snap.data()?.scenarioEvents;
                 if (Array.isArray(se)) {
@@ -1738,7 +1698,6 @@ export default function App() {
       cg = goalValue || 0,
       cf = fireExpense || 0,
       cp = firePassive || 0,
-      ct = fireTaxFactor || 1,
       ce = normalizeScenarioEvents(scenarioEvents),
       cej = JSON.stringify(ce);
     if (
@@ -1746,7 +1705,6 @@ export default function App() {
       cg === remoteGoalRef.current &&
       cf === remoteFireRef.current &&
       cp === remotePassiveRef.current &&
-      ct === remoteTaxRef.current &&
       cej === remoteEventsRef.current
     ) {
       flushCloudSaveRef.current = null;
@@ -1766,7 +1724,6 @@ export default function App() {
             goalValue: cg,
             fireExpense: cf,
             firePassiveIncome: cp,
-            fireTaxFactor: ct,
             scenarioEvents: ce,
             updatedAt: serverTimestamp(),
             updatedAtClient: Date.now(),
@@ -1780,7 +1737,6 @@ export default function App() {
         remoteGoalRef.current = cg;
         remoteFireRef.current = cf;
         remotePassiveRef.current = cp;
-        remoteTaxRef.current = ct;
         remoteEventsRef.current = cej;
         setCloudState("已同步");
         setSaveStatus(`已同步 ${new Date().toLocaleTimeString("zh-TW")}`);
@@ -1798,7 +1754,6 @@ export default function App() {
     goalValue,
     fireExpense,
     firePassive,
-    fireTaxFactor,
     scenarioEvents,
     authReady,
     cloudReady,
@@ -2048,7 +2003,7 @@ export default function App() {
     const annual = (Math.pow(1 + mu / 100, 12) - 1) * 100;
     return annual > 10 ? { mu, annual } : null;
   }, [scenarioRate, scenarioDefaults]);
-  // FIRE：自由數字＝(年支出 − 退休後年收) × 稅費加成 × (100/提領率)，
+  // FIRE：自由數字＝(年支出 − 退休後年收) × (100/提領率)，
   // 達標門檻隨使用者設定的通膨（與情境模擬共用）逐月成長。
   // 退休後年收＝分紅、退休金等退休後仍會持續的被動收入，視為與通膨同步成長
   //（固定名目金額的年金會略被高估）；有負債時起點與進度用淨值
@@ -2057,7 +2012,7 @@ export default function App() {
   const debFireExpense = useDebouncedValue(fireExpense, 150);
   const debFirePassive = useDebouncedValue(firePassive, 150);
   // Monte Carlo 模擬與門檻計算拆開：模擬結果只依賴 pd/latest/滑桿/事件，
-  // 完全不吃年支出／退休後年收／提領率／稅費係數／通膨——那些每個字元變動時
+  // 完全不吃年支出／退休後年收／提領率／通膨——那些每個字元變動時
   // 不該重跑 500 路徑 × 600 個月的模擬，只需重算便宜的門檻
   //（模擬路徑是名目值，通膨只作用在門檻與顯示層）。
   // fireSimActive 用布林值 gating：只在「未使用 ↔ 使用中」切換時才觸發模擬，
@@ -2096,9 +2051,7 @@ export default function App() {
     const INFL = Math.min(5, Math.max(0, Number(inflationPct) || 0)) / 100;
     const multiple = 100 / fireSwr;
     const passive = Math.max(0, debFirePassive || 0);
-    // 提領毛額＝生活費淨缺口 × 加成係數：美股預扣、台股股利稅與二代健保都吃在提領端
-    const netExpense =
-      Math.max(0, debFireExpense - passive) * (fireTaxFactor || 1);
+    const netExpense = Math.max(0, debFireExpense - passive);
     const covered = netExpense <= 0; // 被動收入已覆蓋全部年支出
     const fireNumber = Math.round(netExpense * multiple);
     const usesNetWorth = Number(latest.liabilities || 0) > 0;
@@ -2138,7 +2091,6 @@ export default function App() {
   }, [
     debFireExpense,
     debFirePassive,
-    fireTaxFactor,
     fireSwr,
     inflationPct,
     latest,
@@ -2524,18 +2476,8 @@ export default function App() {
             }
             remotePassiveRef.current = nv;
           }
-          // 稅費係數／一次性事件與 snapshot handler 同語意套用：漏掉的話
+          // 一次性事件與 snapshot handler 同語意套用：漏掉的話
           // remoteRef 停留在本地值，下次上傳（含全部欄位）會以本地預設蓋掉雲端
-          const rt = snap.data()?.fireTaxFactor;
-          if (rt != null) {
-            const nv = Number(rt);
-            const f = nv > 1 && nv <= 2 ? nv : 1;
-            if (localTaxRef.current === remoteTaxRef.current) {
-              setFireTaxInput(f > 1 ? String(f) : "");
-              setFireTaxFactor(f);
-            }
-            remoteTaxRef.current = f;
-          }
           const se = snap.data()?.scenarioEvents;
           if (Array.isArray(se)) {
             const norm = normalizeScenarioEvents(se);
@@ -2583,7 +2525,6 @@ export default function App() {
           goalValue: goalValue || 0,
           fireExpense: fireExpense || 0,
           firePassiveIncome: firePassive || 0,
-          fireTaxFactor: fireTaxFactor || 1,
           scenarioEvents: normalizeScenarioEvents(scenarioEvents),
           updatedAt: serverTimestamp(),
           updatedAtClient: Date.now(),
@@ -2597,7 +2538,6 @@ export default function App() {
       remoteGoalRef.current = goalValue || 0;
       remoteFireRef.current = fireExpense || 0;
       remotePassiveRef.current = firePassive || 0;
-      remoteTaxRef.current = fireTaxFactor || 1;
       remoteEventsRef.current = JSON.stringify(
         normalizeScenarioEvents(scenarioEvents)
       );
@@ -2709,7 +2649,6 @@ export default function App() {
       goalValue: goalValue || 0,
       fireExpense: fireExpense || 0,
       firePassiveIncome: firePassive || 0,
-      fireTaxFactor: fireTaxFactor || 1,
       records: normalizeRecords(records),
       allocation,
     };
@@ -2770,13 +2709,6 @@ export default function App() {
             if (p.firePassiveIncome) {
               setFirePassiveInput(String(p.firePassiveIncome));
               setFirePassive(Number(p.firePassiveIncome));
-            }
-            if (p.fireTaxFactor) {
-              const n = Number(p.fireTaxFactor);
-              if (n > 1 && n <= 2) {
-                setFireTaxInput(String(n));
-                setFireTaxFactor(n);
-              }
             }
             // 資產配置：直接寫回其雲端文件，分頁的 onSnapshot 會即時同步
             if (p.allocation && Array.isArray(p.allocation.assets)) {
@@ -3541,12 +3473,12 @@ export default function App() {
               >
                 占比 {stats.cashRatio.toFixed(1)}%
               </div>
-              {/* 占比在資產成長後會失真，「可撐幾個月」才是備用金最直覺的安全指標；月支出含稅費加成 */}
+              {/* 占比在資產成長後會失真，「可撐幾個月」才是備用金最直覺的安全指標 */}
               <div className="kpi-sub">
                 {fireExpense > 0
                   ? `約可支撐 ${(
                       stats.cashAssets /
-                      ((fireExpense * (fireTaxFactor || 1)) / 12)
+                      (fireExpense / 12)
                     ).toFixed(1)} 個月支出`
                   : "設定年支出後顯示可支撐月數"}
               </div>
@@ -5741,7 +5673,7 @@ export default function App() {
                   財務自由（FIRE）
                 </h3>
                 <p className="card-desc">
-                  自由數字＝（年支出 − 退休後年收）× 支出加成係數 ×{" "}
+                  自由數字＝（年支出 − 退休後年收）×{" "}
                   {Number.isInteger(100 / fireSwr)
                     ? 100 / fireSwr
                     : (100 / fireSwr).toFixed(1)}
@@ -5793,11 +5725,10 @@ export default function App() {
                 />
               </div>
               <div className="seg-group">
-                {/* 快速鍵是「年支出」而非目標資產，檔位須落在一般家庭年支出級距，否則 4% 法則反推的自由數字會嚴重失真 */}
                 {[
-                  { v: 400000, label: "簡約 40萬" },
-                  { v: 600000, label: "舒適 60萬" },
-                  { v: 1000000, label: "寬裕 100萬" },
+                  { v: 6000000, label: "低 600萬" },
+                  { v: 10000000, label: "中 1000萬" },
+                  { v: 15000000, label: "高 1500萬" },
                 ].map((o) => (
                   <button
                     key={o.v}
@@ -5816,44 +5747,6 @@ export default function App() {
                   </button>
                 ))}
               </div>
-            </div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                flexWrap: "wrap",
-                marginTop: 10,
-              }}
-            >
-              <div
-                className="goal-input-wrap"
-                style={{ flex: "0 1 auto", minWidth: 240 }}
-              >
-                <span className="goal-prefix mono">
-                  支出加成係數（稅/健保）
-                </span>
-                <input
-                  className="field-input mono"
-                  type="number"
-                  min={1}
-                  max={2}
-                  step={0.01}
-                  style={{ width: 90 }}
-                  placeholder="1.00"
-                  aria-label="支出加成係數（稅與二代健保），1 到 2"
-                  value={fireTaxInput}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setFireTaxInput(v);
-                    const n = Number(v);
-                    setFireTaxFactor(n > 1 && n <= 2 ? n : 1);
-                  }}
-                />
-              </div>
-              <span style={{ fontSize: 11, color: T.textTertiary }}>
-                退休提領需含稅與二代健保，建議 1.05~1.15
-              </span>
             </div>
             {fireStats && fireMuWarn && (
               <div
@@ -6137,7 +6030,6 @@ export default function App() {
             privacy={privacy}
             active={activeTab === "allocation"}
             fireExpense={fireExpense}
-            fireTaxFactor={fireTaxFactor}
           />
         </ErrorBoundary>
       </div>
@@ -8370,9 +8262,9 @@ function AssetValueCell({ item, inputCurrency, onUpdate, onSanitize }) {
   );
 }
 
-/* fireExpense／fireTaxFactor 由主分頁下傳：此分頁自己沒有年支出設定，
-   「可支撐月數」需與總覽 KPI 同口徑（含稅費加成） */
-function AssetWarroomTab({ isDark, privacy, active, fireExpense, fireTaxFactor }) {
+/* fireExpense 由主分頁下傳：此分頁自己沒有年支出設定，
+   「可支撐月數」需與總覽 KPI 同口徑 */
+function AssetWarroomTab({ isDark, privacy, active, fireExpense }) {
   // 只在首次 render 解析 localStorage（原本每次 render 都重新 JSON.parse 整份資料）
   const initialDataRef = useRef(null);
   if (initialDataRef.current === null)
@@ -10293,12 +10185,12 @@ function AssetWarroomTab({ isDark, privacy, active, fireExpense, fireTaxFactor }
                       fireExpense > 0
                         ? `約可支撐 ${(
                             cashAssetValue /
-                            ((fireExpense * (fireTaxFactor || 1)) / 12)
+                            (fireExpense / 12)
                           ).toFixed(1)} 個月支出`
                         : "設定年支出後顯示可支撐月數"
                     }`}
                     badge={cashStatus}
-                    tooltip="「現金」類資產占總資產的比例，不含緊急備用金。太低缺乏緩衝與加碼空間，太高則拖累長期報酬。可支撐月數＝現金 ÷（年支出 × 稅費加成 ÷ 12），年支出取自總覽的 FIRE 設定。"
+                    tooltip="「現金」類資產占總資產的比例，不含緊急備用金。太低缺乏緩衝與加碼空間，太高則拖累長期報酬。可支撐月數＝現金 ÷（年支出 ÷ 12），年支出取自總覽的 FIRE 設定。"
                   />
                 </div>
                 {[
