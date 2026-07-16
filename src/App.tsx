@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -18,6 +19,7 @@ import {
   CartesianGrid,
   Tooltip,
   ReferenceLine,
+  ReferenceDot,
   Cell,
   PieChart,
   Pie,
@@ -90,6 +92,7 @@ import {
   getFirestore,
   doc,
   setDoc,
+  getDoc,
   onSnapshot,
   serverTimestamp,
 } from "firebase/firestore";
@@ -144,7 +147,8 @@ const THEMES = {
     surfaceInset: "#EDECE9",
     text: "#1C1C1E",
     textSecondary: "#5C5C60",
-    textTertiary: "#77777D",
+    // 原 #77777D 對 #F7F6F3 只有約 4.1:1，調深至 #6B6B70（約 4.9:1）通過 AA，仍保留與 textSecondary 的層級差
+    textTertiary: "#6B6B70",
     textInverse: "#FFFFFF",
     gold: "#1C1C1E",
     goldLight: "rgba(28,28,30,0.05)",
@@ -229,6 +233,89 @@ function useDebouncedValue(value, delay = 150) {
   return v;
 }
 
+/* 桌面表格／手機卡片「二選一」渲染用：原本兩份完整清單常駐 DOM、
+   僅靠 CSS media query 隱藏其一，每次輸入都付兩倍 render 與 diff 成本。
+   用 matchMedia 而非 resize+innerWidth：與 CSS 斷點 768px 精確對齊，
+   且只在跨越斷點時觸發一次 setState，不會拖動視窗時連續重繪 */
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 768px)").matches
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function")
+      return undefined;
+    const mq = window.matchMedia("(max-width: 768px)");
+    const onChange = (e) => setIsMobile(e.matches);
+    // 舊版 Safari 只有 addListener，兩者擇一註冊
+    if (mq.addEventListener) mq.addEventListener("change", onChange);
+    else mq.addListener(onChange);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener("change", onChange);
+      else mq.removeListener(onChange);
+    };
+  }, []);
+  return isMobile;
+}
+
+/* ─── Modal Focus Trap ─── */
+// 最小版 focus trap：aria-modal 宣告了「背景不可及」，不攔 Tab 的話宣告與實際行為矛盾；
+// 開啟時記住觸發元素、把焦點移入 modal，關閉時歸還焦點，鍵盤使用者才不會迷失在遮罩背景裡
+// active：獨立元件的 modal 隨掛載/卸載觸發（預設 true）；
+// 內嵌條件渲染的 modal（如資料管理）則以開關 state 驅動 effect 重跑
+function useFocusTrap(active = true) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!active) return;
+    const node = ref.current;
+    if (!node) return;
+    const prevFocus = document.activeElement;
+    const getFocusables = () =>
+      Array.from(
+        node.querySelectorAll(
+          'button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => !el.disabled && el.offsetParent !== null);
+    // autoFocus 元素已在 commit 階段取得焦點時不搶焦點；
+    // 完全沒有 autoFocus 的 modal（如資料管理）才主動移入第一個可聚焦元素
+    if (!node.contains(document.activeElement)) {
+      const first = getFocusables()[0];
+      if (first) first.focus();
+    }
+    const h = (e) => {
+      if (e.key !== "Tab") return;
+      const list = getFocusables();
+      if (!list.length) return;
+      const first = list[0];
+      const last = list[list.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!node.contains(document.activeElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", h, true);
+    return () => {
+      document.removeEventListener("keydown", h, true);
+      // 觸發元素可能已被卸載（如刪除列後），focus 前先確認仍在文件中
+      if (
+        prevFocus &&
+        typeof prevFocus.focus === "function" &&
+        document.contains(prevFocus)
+      )
+        prevFocus.focus();
+    };
+  }, [active]);
+  return ref;
+}
+
 /* ─── Crosshair Cursor for Charts ─── */
 function ChartCursor({ points, height }) {
   if (!points || !points.length) return null;
@@ -249,9 +336,9 @@ function ChartCursor({ points, height }) {
 }
 
 /* ─── Data ─── */
-function defaultCashByMonth(m) {
-  return m && m < "2025-12" ? 100000 : 0;
-}
+// 現金留空一律視為 0（兩分支同修：舊版 defaultCashByMonth 對 2025-12 前的月份
+// 回填 100,000 是內建歷史資料的個人化遷移值，套在 CSV 匯入與新使用者資料上
+// 會靜默生出幻影現金；呼叫點已全數內聯 0，函式一併移除）
 const INITIAL_RECORDS = [
   {
     month: "2024-04",
@@ -466,8 +553,10 @@ const INITIAL_RECORDS = [
 function migrateRecord(r) {
   const m = r.month || "",
     c =
+      // 空白現金一律視為 0：原本依月份寫死 100,000 是原作者個人歷史的遷移常數，
+      // 對其他使用者是無聲的資料污染
       r.cashAssets == null || r.cashAssets === ""
-        ? defaultCashByMonth(m)
+        ? 0
         : Number(r.cashAssets || 0),
     o =
       r.otherAssets == null || r.otherAssets === ""
@@ -523,16 +612,18 @@ function fmtD(v) {
 function annualizePct(muPct) {
   return (Math.pow(1 + Number(muPct || 0) / 100, 12) - 1) * 100;
 }
+/* 範例資料的正規化 JSON：isExampleRecords 每次比對都要用，模組層算一次即可 */
+const INITIAL_RECORDS_JSON = JSON.stringify(normalizeRecords(INITIAL_RECORDS));
 function safeLoadLocal() {
   try {
     const r = localStorage.getItem(STORAGE_KEY);
     if (!r) return { records: normalizeRecords(INITIAL_RECORDS) };
     const p = JSON.parse(r);
     return {
-      records:
-        Array.isArray(p.records) && p.records.length
-          ? normalizeRecords(p.records)
-          : normalizeRecords(INITIAL_RECORDS),
+      // 空陣列也是合法狀態：使用者「清空全部」後重新整理，不該讓範例資料復活
+      records: Array.isArray(p.records)
+        ? normalizeRecords(p.records)
+        : normalizeRecords(INITIAL_RECORDS),
     };
   } catch {
     return { records: normalizeRecords(INITIAL_RECORDS) };
@@ -543,6 +634,32 @@ function persistLocal(r) {
     STORAGE_KEY,
     JSON.stringify({ records: normalizeRecords(r), updatedAt: Date.now() })
   );
+}
+// goal／FIRE 設定的本機備援：records 有 persistLocal、fireSwr 有 agwr_fire_swr，
+// 這三個欄位過去只存在雲端文件，離線重整就歸零；比照 records 補上備援
+const GOAL_FIRE_BACKUP_KEY = "agwr_goal_fire_backup";
+function loadGoalFireBackup() {
+  try {
+    const p = JSON.parse(localStorage.getItem(GOAL_FIRE_BACKUP_KEY) || "null");
+    return {
+      goalValue: Number(p?.goalValue) || 0,
+      fireExpense: Number(p?.fireExpense) || 0,
+      firePassive: Number(p?.firePassive) || 0,
+    };
+  } catch {
+    return { goalValue: 0, fireExpense: 0, firePassive: 0 };
+  }
+}
+/* 情境一次性事件的正規化：雲端／本機還原時統一欄位型別。
+   month/amount 維持字串（輸入框需可清空），欄位順序固定讓 JSON 比對（回音守衛）穩定 */
+function normalizeScenarioEvents(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 5).map((e) => ({
+    id: e && e.id ? String(e.id) : generateId(),
+    month: e && e.month != null ? String(e.month) : "12",
+    amount: e && e.amount != null ? String(e.amount) : "",
+    label: e && e.label ? String(e.label) : "",
+  }));
 }
 function toDateFM(m, mode = "end") {
   const [y, mo] = String(m).split("-").map(Number);
@@ -592,7 +709,9 @@ function calcProcessed(records) {
   const s = [...records].sort((a, b) => a.month.localeCompare(b.month));
   let tp = 0,
     ip = 0,
-    ct = 1;
+    ct = 1,
+    // 停滯月（總資產與上月相同）期間結轉中的淨現金流
+    pendFlow = 0;
   return s.map((r, i) => {
     const p = i > 0 ? s[i - 1] : null;
     const pA = p ? Number(p.totalAssets || 0) : 0,
@@ -609,7 +728,24 @@ function calcProcessed(records) {
       tc = tA - pA,
       ng = tA - pA - ncf;
     const rr = pA === 0 ? 0 : (ng / pA) * 100;
-    ct *= 1 + rr / 100;
+    // 有效月報酬（TWR 專用口徑）：停滯月不產生報酬——假負報酬會把當月入金誤歸類為
+    // 市場虧損、隔月再假回升，其淨現金流「結轉」給下一個有效月份合併計算：
+    // 合併報酬 =（新值 − 停滯前基期值 − 期間全部淨現金流）/ 停滯前基期值
+    //（停滯期間總資產不變，故基期值即本列 prevAssets）。
+    // 此序列供三處共用以確保口徑一致：總覽 KPI（twrStats）、年度卡 twrFactor、
+    // 分析頁累積報酬圖（下方 cumulativeTwrRate）
+    let effRate = null;
+    if (i > 0 && pA > 0) {
+      if (tA === pA) {
+        pendFlow += ncf;
+      } else {
+        effRate = ((tA - pA - (pendFlow + ncf)) / pA) * 100;
+        pendFlow = 0;
+      }
+    } else {
+      pendFlow = 0;
+    }
+    if (effRate !== null) ct *= 1 + effRate / 100;
     tp = Math.max(tp, tA);
     ip = Math.max(ip, iA);
     return {
@@ -628,6 +764,7 @@ function calcProcessed(records) {
       totalChange: tc,
       netGain: ng,
       returnRate: rr,
+      effReturnRate: effRate,
       cashChange: cA - pC,
       otherChange: oA - pO,
       investedChange: iA - pI,
@@ -640,6 +777,8 @@ function calcProcessed(records) {
 }
 function getAnnualSummary(pd) {
   const g = {};
+  // 進行中年度判定基準：資料最新月份所在年度
+  const lastYr = pd.length ? getYear(pd[pd.length - 1].month) : null;
   pd.forEach((r, i) => {
     const yr = getYear(r.month);
     if (!g[yr]) {
@@ -659,6 +798,8 @@ function getAnnualSummary(pd) {
       }
       g[yr] = {
         year: yr,
+        // 資料第一年：起始值＝首筆月底總資產，MWR 起始日與首筆流量須特別處理
+        isFirstYear: i === 0,
         startAssets: sA,
         startCashAssets: sC,
         startOtherAssets: sO,
@@ -674,9 +815,14 @@ function getAnnualSummary(pd) {
     g[yr].endAssets = Number(r.totalAssets || 0);
     g[yr].endCashAssets = Number(r.cashAssets || 0);
     g[yr].endOtherAssets = Number(r.otherAssets || 0);
-    g[yr].totalNetInflow += Number(r.netCashFlow || 0);
+    // 首筆紀錄的淨現金流已內含於起始資產（起始值＝該月月底總資產），
+    // 再計入會使淨增值與 MWR 重複扣除一次
+    if (i > 0) g[yr].totalNetInflow += Number(r.netCashFlow || 0);
     g[yr].months += 1;
-    g[yr].twrFactor *= 1 + Number(r.returnRate || 0) / 100;
+    // 用結轉後的有效月報酬（與總覽 KPI、分析頁累積報酬圖同口徑）：
+    // 停滯月不產生報酬，跨年停滯的合併報酬自然歸屬「恢復更新月份」所在年度
+    if (r.effReturnRate !== null && r.effReturnRate !== undefined)
+      g[yr].twrFactor *= 1 + Number(r.effReturnRate) / 100;
     g[yr].rows.push(r);
   });
   return Object.values(g)
@@ -695,8 +841,17 @@ function getAnnualSummary(pd) {
         twr = (it.twrFactor - 1) * 100;
       const cfs = [];
       if (sA > 0)
-        cfs.push({ date: toDateFM(`${it.year}-01`, "start"), amount: -sA });
-      it.rows.forEach((r) => {
+        cfs.push({
+          // 資料第一年的起始值是首筆「月底」總資產，日期須對齊首筆月份月底，
+          // 硬定 1/1 會讓 XIRR 的投資期間憑空多出數個月、首年年化被低估
+          date: it.isFirstYear
+            ? toDateFM(it.rows[0].month, "end")
+            : toDateFM(`${it.year}-01`, "start"),
+          amount: -sA,
+        });
+      it.rows.forEach((r, ri) => {
+        // 首筆紀錄的流量已內含於起始資產，推入會重複扣除
+        if (it.isFirstYear && ri === 0) return;
         const n = Number(r.netCashFlow || 0);
         if (n !== 0) cfs.push({ date: toDateFM(r.month, "end"), amount: -n });
       });
@@ -707,6 +862,25 @@ function getAnnualSummary(pd) {
         ),
         amount: eA,
       });
+      // 部分年度（紀錄未滿 12 個月）：XIRR 天生年化，會把短期間報酬外推成年率、
+      // 與期間制的 TWR 並排誤導判讀（首個部分年度尤其明顯：9 個月的報酬被放大成
+      // 年化後遠高於 TWR），因此不只進行中年度，任何未滿 12 個月的年度一律反年化
+      // 為期間值；完整 12 個月年度維持年化。
+      // 指數用「該年度首末紀錄的實際日曆月跨度」而非紀錄筆數：中間整月漏登時
+      // 筆數會低估實際經過的時間、期間值被錯誤壓縮
+      let mwr = xirr(cfs, 0.1);
+      const mwrIsPartial = it.months < 12;
+      // YTD 僅指「資料最新年度」的部分年度；歷史部分年度（如首年 4 月起帳）
+      // 用「期間」標示，label 才不會誤稱過去年份為年初至今
+      const mwrIsYtd = mwrIsPartial && it.year === lastYr;
+      if (mwrIsPartial && mwr !== null) {
+        const fm = Number(String(it.rows[0].month).slice(5, 7)),
+          lm = Number(
+            String(it.rows[it.rows.length - 1].month).slice(5, 7)
+          );
+        const spanM = Math.max(1, lm - fm + 1);
+        mwr = (Math.pow(1 + mwr / 100, spanM / 12) - 1) * 100;
+      }
       return {
         ...it,
         startAssets: sA,
@@ -717,13 +891,25 @@ function getAnnualSummary(pd) {
         wealthNetGain: wng,
         endCashRatio: ecr,
         twr,
-        mwr: xirr(cfs, 0.1),
+        mwr,
+        mwrIsYtd,
+        mwrIsPartial,
       };
     })
     .sort((a, b) => Number(b.year) - Number(a.year));
 }
+/* 統計取值口徑：一律優先取有效月報酬（effReturnRate，停滯月流量已結轉合併）——
+   raw returnRate 會把「停滯後恢復月」的結轉入金當成報酬（假勝月），
+   勝率／分布／σ／連勝全都會被污染。樣本不足退回全列時（basisPd fallback），
+   停滯月與首筆沒有有效值，才退回 raw returnRate 維持舊行為 */
+function statRet(r) {
+  return r.effReturnRate !== null && r.effReturnRate !== undefined
+    ? Number(r.effReturnRate)
+    : Number(r.returnRate || 0);
+}
 function getReturnDist(pd) {
-  // 區間採 (min, max]：0% 落在「-3~0%」桶，與勝率定義（>0 才算贏）一致
+  // 區間採 (min, max]：0% 落在「-3~0%」桶，與勝率定義（>0 才算贏）一致；
+  // 取有效報酬（statRet）而非 raw returnRate，與勝率／σ 同口徑
   return [
     { label: "≤ -3%", min: -Infinity, max: -3, color: T.negative },
     { label: "-3~0%", min: -3, max: 0, color: T.amber },
@@ -731,8 +917,7 @@ function getReturnDist(pd) {
     { label: "> 3%", min: 3, max: Infinity, color: T.positive },
   ].map((b) => ({
     ...b,
-    count: pd.filter((r) => r.returnRate > b.min && r.returnRate <= b.max)
-      .length,
+    count: pd.filter((r) => statRet(r) > b.min && statRet(r) <= b.max).length,
   }));
 }
 function toCSV(r) {
@@ -927,43 +1112,61 @@ function addMonths(m, n) {
   const d = new Date(y, mo - 1 + n, 1);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
-/* 情境模擬統計基礎：近12月，排除「總資產與上月完全相同」的未更新月份
-   （沒更新的月份會算出假的負報酬＋隔月假暴漲，把 σ 灌水） */
+// 中位數：偶數樣本取中間兩數平均（固定取上位數會系統性偏高）
+function medianOf(sortedArr) {
+  const n = sortedArr.length;
+  if (!n) return 0;
+  const mid = Math.floor(n / 2);
+  return n % 2 ? sortedArr[mid] : (sortedArr[mid - 1] + sortedArr[mid]) / 2;
+}
+// 月均投入（剔除大額單月）：|淨現金流| 超過中位數 4 倍且大於 30 萬的一次性事件
+// （貸款入金、賣房、年終）不該被外推成「每個月都會發生」；剔除後樣本不足 6 個月
+// 則退回全樣本。近 12 個月與再前 12 個月共用同一套規則，年增率比較才同口徑
+function trimmedAvgFlow(rows) {
+  const flows = rows.map((r) => Number(r.netCashFlow || 0));
+  const medAbs = medianOf(flows.map(Math.abs).sort((a, b) => a - b));
+  const isExtremeFlow = (f) => Math.abs(f) > Math.max(medAbs * 4, 300000);
+  const normalFlows = flows.filter((f) => !isExtremeFlow(f));
+  const flowBasis = normalFlows.length >= 6 ? normalFlows : flows;
+  return {
+    avg: flowBasis.reduce((a, b) => a + b, 0) / (flowBasis.length || 1),
+    excluded: flows.length - flowBasis.length,
+  };
+}
+/* 情境模擬統計基礎：近12月，樣本＝有效月報酬（effReturnRate 非 null 的列），
+   自動排除未更新月份（假負報酬＋隔月假暴漲會把 σ 灌水）與首筆的人工 0%。
+   已知取捨：停滯後恢復月的 effReturnRate 是「合併報酬」（橫跨停滯期多個日曆月），
+   當成單月樣本會略高估 σ——但比 raw 口徑把結轉入金記成報酬的系統性偏差小得多 */
 function getScenarioStats(pd) {
   const l12 = pd.slice(-12);
   const real = l12.filter(
-    (r) => Number(r.totalAssets) !== Number(r.prevAssets)
+    (r) => r.effReturnRate !== null && r.effReturnRate !== undefined
   );
   const basis = real.length >= 4 ? real : l12;
-  const rets = basis.map((r) => r.returnRate / 100);
+  // 樣本不足退回 l12 時部分列沒有有效值，statRet 會退回 raw returnRate
+  const rets = basis.map((r) => statRet(r) / 100);
   const avg = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
   const std = Math.sqrt(
     rets.reduce((s, r) => s + (r - avg) ** 2, 0) / (rets.length || 1)
   );
-  // 月均投入：剔除大額單月（|淨現金流| 超過中位數 4 倍、且大於 30 萬）——
-  // 貸款入金、賣房、年終等一次性事件不該被外推成「每個月都會發生」
-  const flows = l12.map((r) => Number(r.netCashFlow || 0));
-  const sortedAbs = flows.map(Math.abs).sort((a, b) => a - b);
-  const medAbs = sortedAbs.length
-    ? sortedAbs[Math.floor(sortedAbs.length / 2)]
-    : 0;
-  const isExtremeFlow = (f) => Math.abs(f) > Math.max(medAbs * 4, 300000);
-  const normalFlows = flows.filter((f) => !isExtremeFlow(f));
-  const flowBasis = normalFlows.length >= 6 ? normalFlows : flows;
-  const avgIn = flowBasis.reduce((a, b) => a + b, 0) / (flowBasis.length || 1);
-  const excludedFlowMonths = flows.length - flowBasis.length;
+  // 月均投入：剔除規則抽成 trimmedAvgFlow，與前 12 個月共用
+  const { avg: avgIn, excluded: excludedFlowMonths } = trimmedAvgFlow(l12);
   // 投入年增率自動推估：近 12 個月 vs 再前 12 個月的平均投入相比。
   // 需至少 24 個月資料；限制 0~10%、負值歸 0（一次性提領或大額投入會污染長期外推，
   // 手動滑桿永遠優先——調薪幅度是使用者自己最清楚的資訊）
   let inflowGrowth = 0;
   let inflowGrowthEstimated = false;
+  // 停用原因分開記錄：資料月數不足 vs 平均投入非正（如淨提領期），
+  // 文案才不會在資料已滿 24 個月時還顯示「資料未滿」的錯誤理由
+  let inflowGrowthSkipReason = "資料未滿 24 個月";
   if (pd.length >= 24) {
-    const prev12 = pd.slice(-24, -12);
-    const prevAvg =
-      prev12.reduce((a, r) => a + Number(r.netCashFlow || 0), 0) / 12;
+    // 前 12 個月同樣剔除大額單月，否則前一年恰有一次性入金時年增率會被壓到 0
+    const prevAvg = trimmedAvgFlow(pd.slice(-24, -12)).avg;
     if (prevAvg > 0 && avgIn > 0) {
       inflowGrowth = Math.min(10, Math.max(0, (avgIn / prevAvg - 1) * 100));
       inflowGrowthEstimated = true;
+    } else {
+      inflowGrowthSkipReason = "近期或前期平均投入為 0 或負值，無法推估";
     }
   }
   return {
@@ -973,6 +1176,7 @@ function getScenarioStats(pd) {
     excludedFlowMonths,
     inflowGrowth,
     inflowGrowthEstimated,
+    inflowGrowthSkipReason,
     sampleMonths: basis.length,
     excludedMonths: l12.length - basis.length,
   };
@@ -1051,7 +1255,8 @@ function projectScenarios(
   return { scenarios, paths };
 }
 function cashRC(r) {
-  return r < 3 ? T.negative : r < 5 ? T.amber : r > 25 ? T.amber : T.emerald;
+  // 門檻與資產配置分頁的「現金水位」對齊（<5 偏低、>30 偏高），避免兩頁結論打架
+  return r < 5 ? T.amber : r > 30 ? T.amber : T.emerald;
 }
 
 /* ═══════════ MAIN APP ═══════════ */
@@ -1084,8 +1289,14 @@ export default function App() {
   const [editingMonth, setEditingMonth] = useState("");
   const [toast, setToast] = useState("");
   const [hasSubmitted, setHasSubmitted] = useState(false);
-  const [goalInput, setGoalInput] = useState("");
-  const [goalValue, setGoalValue] = useState(0);
+  // lazy init：只在首次 render 讀一次 localStorage 備援；雲端 snapshot 到達後覆蓋
+  const gfbRef = useRef(null);
+  if (gfbRef.current === null) gfbRef.current = loadGoalFireBackup();
+  const gfb = gfbRef.current;
+  const [goalInput, setGoalInput] = useState(
+    gfb.goalValue ? String(gfb.goalValue) : ""
+  );
+  const [goalValue, setGoalValue] = useState(gfb.goalValue);
   const [cloudState, setCloudState] = useState("準備連線...");
   const [cloudReady, setCloudReady] = useState(false);
   const [authReady, setAuthReady] = useState(false);
@@ -1117,20 +1328,82 @@ export default function App() {
   const debScenarioInflow = useDebouncedValue(scenarioInflow, 150);
   const debScenarioSigma = useDebouncedValue(scenarioSigma, 150);
   const debScenarioInflowGrowth = useDebouncedValue(scenarioInflowGrowth, 150);
-  // 一次性事件（信貸入金＋／頭期款支出−）：session 內有效，輸入存字串以便清空
-  const [scenarioEvents, setScenarioEvents] = useState([]);
+  // 一次性事件（信貸入金＋／頭期款支出−）：屬於長期計畫資料（頭期款、信貸入金），
+  // 比照目標／FIRE 設定做本機＋雲端持久化，重開頁面不歸零；輸入存字串以便清空
+  const [scenarioEvents, setScenarioEvents] = useState(() => {
+    try {
+      return normalizeScenarioEvents(
+        JSON.parse(localStorage.getItem("agwr_scenario_events") || "[]")
+      );
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "agwr_scenario_events",
+        JSON.stringify(normalizeScenarioEvents(scenarioEvents))
+      );
+    } catch {}
+  }, [scenarioEvents]);
+  // 通膨假設（%／年）：長天期名目值購買力會失真，供情境模擬「實質」模式與 FIRE 門檻共用
+  const [inflationPct, setInflationPct] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("agwr_inflation"));
+      return Number.isFinite(v) && v >= 0 && v <= 5 ? v : 2;
+    } catch {
+      return 2;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("agwr_inflation", String(inflationPct));
+    } catch {}
+  }, [inflationPct]);
+  // 情境模擬顯示口徑：名目金額（預設）／實質購買力（折算回今日物價）
+  const [scenarioReal, setScenarioReal] = useState(false);
   const [animTab, setAnimTab] = useState(activeTab);
   const visitedTabsRef = useRef(null);
   if (visitedTabsRef.current === null)
     visitedTabsRef.current = { [activeTab]: true };
   const [showDataModal, setShowDataModal] = useState(false);
+  // 資料管理 modal 為內嵌條件渲染，focus trap 以開關 state 驅動
+  const dataModalTrapRef = useFocusTrap(showDataModal);
   const csvInputRef = useRef(null);
   const jsonInputRef = useRef(null);
-  const [fireInput, setFireInput] = useState("");
-  const [fireExpense, setFireExpense] = useState(0);
+  const [fireInput, setFireInput] = useState(
+    gfb.fireExpense ? String(gfb.fireExpense) : ""
+  );
+  const [fireExpense, setFireExpense] = useState(gfb.fireExpense);
   // 退休後年收入（分紅、退休金等會持續的被動收入）：自由數字只需覆蓋「年支出−這筆」的缺口
-  const [firePassiveInput, setFirePassiveInput] = useState("");
-  const [firePassive, setFirePassive] = useState(0);
+  const [firePassiveInput, setFirePassiveInput] = useState(
+    gfb.firePassive ? String(gfb.firePassive) : ""
+  );
+  const [firePassive, setFirePassive] = useState(gfb.firePassive);
+  // 支出加成係數（稅／二代健保）：退休提領的毛額高於生活費淨額，
+  // 預設 1.0 不加成；限 1~2 之外的輸入視為未設定，避免打錯字讓自由數字爆掉
+  const [fireTaxInput, setFireTaxInput] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("agwr_fire_tax"));
+      return v > 1 && v <= 2 ? String(v) : "";
+    } catch {
+      return "";
+    }
+  });
+  const [fireTaxFactor, setFireTaxFactor] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("agwr_fire_tax"));
+      return v > 1 && v <= 2 ? v : 1;
+    } catch {
+      return 1;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("agwr_fire_tax", String(fireTaxFactor));
+    } catch {}
+  }, [fireTaxFactor]);
   const [hoveredMonth, setHoveredMonth] = useState(null);
   // 熱力圖點選的月份：hover tooltip 手機看不到，改成點擊顯示明細列
   const [hmSel, setHmSel] = useState(null);
@@ -1173,9 +1446,32 @@ export default function App() {
   const [confirmDlg, setConfirmDlg] = useState(null);
   // 刪除復原改多筆堆疊：連刪多筆各自都能在 6 秒內復原（原本單槽會被後一筆蓋掉）
   const [undoDels, setUndoDels] = useState([]);
+  // 紀錄分頁桌面表格／手機卡片二選一渲染（原本兩份 DOM 常駐靠 CSS 隱藏其一）
+  const isMobile = useIsMobile();
   // Sync module-level T before render
   T = isDark ? THEMES.dark : THEMES.light;
   const css = useMemo(() => makeCSS(T), [isDark]);
+  // 字型改為 mount 時注入 <link>：原本 @import 埋在 JS 注入的 <style> 內，
+  // 形成「JS 執行 → CSS 注入 → 字型 CSS → 字型檔」三段串行，FOUT 期間更長；
+  // 用 preconnect 先建連線、<link rel=stylesheet> 讓瀏覽器並行抓取
+  useEffect(() => {
+    const FONT_HREF =
+      "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,300..800&display=swap";
+    // 已注入過就不重複（StrictMode 雙重掛載、或 index.html 已自帶時）
+    if (document.querySelector(`link[href="${FONT_HREF}"]`)) return;
+    [
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", cross: true },
+      { rel: "stylesheet", href: FONT_HREF },
+    ].forEach(({ rel, href, cross }) => {
+      const l = document.createElement("link");
+      l.rel = rel;
+      l.href = href;
+      if (cross) l.crossOrigin = "anonymous";
+      document.head.appendChild(l);
+    });
+    // 字型是全域資源，不在 cleanup 移除：避免重掛時反覆下載造成閃爍
+  }, []);
   const mask = (s) => (privacy ? "＊＊＊＊＊" : s);
   useEffect(() => {
     if (!showDataModal) return;
@@ -1187,13 +1483,40 @@ export default function App() {
   }, [showDataModal]);
   const remoteAppliedRef = useRef(false);
   const saveTimerRef = useRef(null);
+  // 關頁 flush 用：指向當前待送出的防抖上傳，pagehide 時立即執行不等 timer
+  const flushCloudSaveRef = useRef(null);
+  // 本地最後編輯時間：覆蓋守衛用——比它舊的遠端 snapshot 不得蓋掉未上雲的本地變更
+  const lastLocalEditAtRef = useRef(0);
   // lazy init：stringify 只在首次 render 執行一次；此初值僅在雲端 snapshot 到達前有意義
   const remoteJsonRef = useRef(null);
   if (remoteJsonRef.current === null)
     remoteJsonRef.current = JSON.stringify(normalizeRecords(records));
-  const remoteGoalRef = useRef(0);
-  const remoteFireRef = useRef(0);
-  const remotePassiveRef = useRef(0);
+  // 以本機備援值初始化：若初值為 0 而本機載入非 0，啟動瞬間會被誤判成 pending
+  // 變更，反而擋掉雲端值的正常套用
+  const remoteGoalRef = useRef(gfb.goalValue);
+  const remoteFireRef = useRef(gfb.fireExpense);
+  const remotePassiveRef = useRef(gfb.firePassive);
+  // 稅費係數同理：初值對齊 agwr_fire_tax 載入的 state 初值
+  const remoteTaxRef = useRef(fireTaxFactor);
+  // 一次性事件的回音守衛以正規化 JSON 比對（陣列無法用 === 比對）；
+  // lazy init：stringify 只在首次 render 執行一次，初值對齊 agwr_scenario_events 載入值
+  const remoteEventsRef = useRef(null);
+  if (remoteEventsRef.current === null)
+    remoteEventsRef.current = JSON.stringify(
+      normalizeScenarioEvents(scenarioEvents)
+    );
+  // snapshot handler 是掛載時的閉包讀不到最新 state：用 ref 鏡射目前值供回音守衛比對
+  const localGoalRef = useRef(gfb.goalValue);
+  const localFireRef = useRef(gfb.fireExpense);
+  const localPassiveRef = useRef(gfb.firePassive);
+  const localTaxRef = useRef(fireTaxFactor);
+  const localEventsRef = useRef(remoteEventsRef.current);
+  // 範例資料偵測：與內建 INITIAL_RECORDS 逐筆相同才成立，任何一筆被修改即視為使用者資料。
+  // 比照資產配置分頁 isExampleData 的作法，避免新使用者把範例當成自己（或別人）的真實資產
+  const isExampleRecords = useMemo(
+    () => JSON.stringify(normalizeRecords(records)) === INITIAL_RECORDS_JSON,
+    [records]
+  );
   const [formData, setFormData] = useState({
     month: getCurrentMonth(),
     totalAssets: "",
@@ -1206,6 +1529,9 @@ export default function App() {
   });
 
   useEffect(() => {
+    // 遠端套用也會走到這裡，但那時 state 與 remoteJsonRef 一致（無 pending），
+    // 覆蓋守衛不會因此誤判，故不需區分變更來源
+    lastLocalEditAtRef.current = Date.now();
     try {
       persistLocal(records);
       setSaveStatus(`已儲存 ${new Date().toLocaleTimeString("zh-TW")}`);
@@ -1214,6 +1540,32 @@ export default function App() {
       setSaveStatus("失敗:" + (e?.code || e?.message || ""));
     }
   }, [records]);
+  useEffect(() => {
+    // 鏡射目前值供 snapshot 閉包比對，並同步寫入本機備援（離線重整不歸零）
+    localGoalRef.current = goalValue || 0;
+    localFireRef.current = fireExpense || 0;
+    localPassiveRef.current = firePassive || 0;
+    try {
+      localStorage.setItem(
+        GOAL_FIRE_BACKUP_KEY,
+        JSON.stringify({
+          goalValue: goalValue || 0,
+          fireExpense: fireExpense || 0,
+          firePassive: firePassive || 0,
+        })
+      );
+    } catch {}
+  }, [goalValue, fireExpense, firePassive]);
+  // 稅費係數／一次性事件的鏡射：供 snapshot 閉包做 pending 回音守衛比對；
+  // 本機備援分別由 agwr_fire_tax、agwr_scenario_events 的 effect 負責，這裡不重複寫入
+  useEffect(() => {
+    localTaxRef.current = fireTaxFactor || 1;
+  }, [fireTaxFactor]);
+  useEffect(() => {
+    localEventsRef.current = JSON.stringify(
+      normalizeScenarioEvents(scenarioEvents)
+    );
+  }, [scenarioEvents]);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 2400);
@@ -1248,33 +1600,88 @@ export default function App() {
               const recs = Array.isArray(rr) ? normalizeRecords(rr) : null;
               if (recs && recs.length) {
                 const rj = JSON.stringify(recs);
+                // 覆蓋守衛比對用：套用前的遠端基準（remoteJsonRef 即將被更新）
+                const prevRemoteJson = remoteJsonRef.current;
+                const remoteAt = Number(snap.data()?.updatedAtClient || 0);
                 remoteJsonRef.current = rj;
                 remoteAppliedRef.current = true;
                 setCloudReady(true);
+                // goal/FIRE 回音守衛：本地有 pending 變更（輸入中、尚未上傳完成）時
+                // 不套用遠端，避免伺服器回音把打到一半的數字重設回舊值且永不補傳；
+                // remoteRef 仍更新，讓防抖 effect 偵測差異把本地值補上雲。
                 // != null 而非 truthy：0（已清除）也要同步到其他裝置，只有欄位不存在才跳過
                 const rg = snap.data()?.goalValue;
                 if (rg != null) {
                   const n = Number(rg) || 0;
-                  setGoalInput(n ? String(n) : "");
-                  setGoalValue(n);
+                  if (localGoalRef.current === remoteGoalRef.current) {
+                    setGoalInput(n ? String(n) : "");
+                    setGoalValue(n);
+                  }
                   remoteGoalRef.current = n;
                 }
                 const rf = snap.data()?.fireExpense;
                 if (rf != null) {
                   const n = Number(rf) || 0;
-                  setFireInput(n ? String(n) : "");
-                  setFireExpense(n);
+                  if (localFireRef.current === remoteFireRef.current) {
+                    setFireInput(n ? String(n) : "");
+                    setFireExpense(n);
+                  }
                   remoteFireRef.current = n;
                 }
                 const fp = snap.data()?.firePassiveIncome;
                 if (fp != null) {
                   const n = Number(fp) || 0;
-                  setFirePassiveInput(n ? String(n) : "");
-                  setFirePassive(n);
+                  if (localPassiveRef.current === remotePassiveRef.current) {
+                    setFirePassiveInput(n ? String(n) : "");
+                    setFirePassive(n);
+                  }
                   remotePassiveRef.current = n;
                 }
+                const rt = snap.data()?.fireTaxFactor;
+                if (rt != null) {
+                  const n = Number(rt);
+                  const f = n > 1 && n <= 2 ? n : 1;
+                  // 比照 goalValue：本地有 pending 變更時不套用遠端，只更新基準待補傳
+                  if (localTaxRef.current === remoteTaxRef.current) {
+                    setFireTaxInput(f > 1 ? String(f) : "");
+                    setFireTaxFactor(f);
+                  }
+                  remoteTaxRef.current = f;
+                }
+                const se = snap.data()?.scenarioEvents;
+                if (Array.isArray(se)) {
+                  const norm = normalizeScenarioEvents(se);
+                  const js = JSON.stringify(norm);
+                  // 回音守衛：自己剛上傳的內容回彈時不覆寫本地（避免新 reference 白跑下游）
+                  if (js !== remoteEventsRef.current) {
+                    // 比照 goalValue 的 pending 守衛：輸入中的事件欄位不被遠端重設，
+                    // remoteRef 仍更新，讓防抖 effect 偵測差異把本地值補上雲
+                    if (localEventsRef.current === remoteEventsRef.current)
+                      setScenarioEvents(norm);
+                    remoteEventsRef.current = js;
+                  }
+                }
                 setRecords((cur) => {
-                  if (JSON.stringify(normalizeRecords(cur)) === rj) return cur;
+                  const curJson = JSON.stringify(normalizeRecords(cur));
+                  if (curJson === rj) return cur;
+                  // 覆蓋守衛：本地有未上雲的變更（防抖窗、離線、hydration 前的編輯）
+                  // 且遠端版本比本地最後編輯舊時，不讓舊雲端靜默蓋掉新本地。
+                  // remoteJsonRef 已指向雲端版本，防抖 effect 會偵測差異把本地補傳上雲
+                  if (
+                    curJson !== prevRemoteJson &&
+                    remoteAt < lastLocalEditAtRef.current
+                  )
+                    return cur;
+                  // 覆蓋 localStorage 前把被取代的本機版本留一份，誤蓋時還有救
+                  try {
+                    localStorage.setItem(
+                      STORAGE_KEY + "_conflict_backup",
+                      JSON.stringify({
+                        records: normalizeRecords(cur),
+                        updatedAt: Date.now(),
+                      })
+                    );
+                  } catch {}
                   persistLocal(recs);
                   setSaveStatus(
                     `已同步 ${new Date().toLocaleTimeString("zh-TW")}`
@@ -1282,7 +1689,7 @@ export default function App() {
                   setToast("已從雲端同步");
                   return recs;
                 });
-                setCloudState("已連線");
+                setCloudState("已同步");
               } else {
                 remoteAppliedRef.current = true;
                 setCloudReady(true);
@@ -1314,21 +1721,42 @@ export default function App() {
     };
   }, []);
   useEffect(() => {
-    if (!authReady || !cloudReady || !remoteAppliedRef.current) return;
+    if (!authReady || !cloudReady || !remoteAppliedRef.current) {
+      flushCloudSaveRef.current = null;
+      return;
+    }
+    // 範例資料未被修改前不上傳：空雲端文件不該被種子資料佔據成「正式資料」。
+    // 此時連線其實正常，順手覆蓋掉空文件分支留下的「上傳中...」以免 header 卡住；
+    // flush ref 一併清空，關頁 flush 也不得把種子資料送上雲
+    if (isExampleRecords) {
+      setCloudState("已連線");
+      flushCloudSaveRef.current = null;
+      return;
+    }
     const cn = normalizeRecords(records),
       cj = JSON.stringify(cn),
       cg = goalValue || 0,
       cf = fireExpense || 0,
-      cp = firePassive || 0;
+      cp = firePassive || 0,
+      ct = fireTaxFactor || 1,
+      ce = normalizeScenarioEvents(scenarioEvents),
+      cej = JSON.stringify(ce);
     if (
       cj === remoteJsonRef.current &&
       cg === remoteGoalRef.current &&
       cf === remoteFireRef.current &&
-      cp === remotePassiveRef.current
-    )
+      cp === remotePassiveRef.current &&
+      ct === remoteTaxRef.current &&
+      cej === remoteEventsRef.current
+    ) {
+      flushCloudSaveRef.current = null;
       return;
+    }
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(async () => {
+    const doSave = async () => {
+      // flush 與 timer 都可能觸發：先解除彼此，避免同一筆上傳送兩次
+      flushCloudSaveRef.current = null;
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       try {
         const { db } = getFirebaseServices();
         await setDoc(
@@ -1338,6 +1766,8 @@ export default function App() {
             goalValue: cg,
             fireExpense: cf,
             firePassiveIncome: cp,
+            fireTaxFactor: ct,
+            scenarioEvents: ce,
             updatedAt: serverTimestamp(),
             updatedAtClient: Date.now(),
             updatedBy: cloudUid || "anon",
@@ -1350,12 +1780,16 @@ export default function App() {
         remoteGoalRef.current = cg;
         remoteFireRef.current = cf;
         remotePassiveRef.current = cp;
+        remoteTaxRef.current = ct;
+        remoteEventsRef.current = cej;
         setCloudState("已同步");
         setSaveStatus(`已同步 ${new Date().toLocaleTimeString("zh-TW")}`);
       } catch {
         setCloudState("儲存失敗");
       }
-    }, 700);
+    };
+    saveTimerRef.current = setTimeout(doSave, 700);
+    flushCloudSaveRef.current = doSave;
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
@@ -1364,10 +1798,31 @@ export default function App() {
     goalValue,
     fireExpense,
     firePassive,
+    fireTaxFactor,
+    scenarioEvents,
     authReady,
     cloudReady,
     cloudUid,
+    isExampleRecords,
   ]);
+  // 關頁前 flush：手機記完帳立刻關分頁是常態，等 700ms 防抖會漏掉最後一筆，
+  // 之後他機上傳會讓這筆連 localStorage 一起被雲端覆蓋。Firestore 寫入會在背景排隊，
+  // pagehide 時同步呼叫即可
+  useEffect(() => {
+    const flush = () => {
+      const f = flushCloudSaveRef.current;
+      if (f) f();
+    };
+    const onVis = () => {
+      if (document.hidden) flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   const pd = useMemo(() => calcProcessed(records), [records]);
   const annualSummary = useMemo(() => getAnnualSummary(pd), [pd]);
@@ -1381,10 +1836,13 @@ export default function App() {
       [...new Set(records.map((r) => getYear(r.month)))].sort((a, b) => b - a),
     [records]
   );
-  // 全域統計與情境模擬同口徑：排除「總資產與上月相同」的未更新月份
+  // 全域統計與情境模擬同口徑：樣本＝有效月報酬（effReturnRate 非 null 的列），
+  // 自動排除未更新月份與首筆（prevAssets===0）——排除之外，統計值也一律取
+  // effReturnRate 而非 raw returnRate：停滯後恢復月的 raw 值把結轉入金當成報酬，
+  // 會憑空多出假勝月並污染分布與 σ（統計取值統一走 statRet）
   const basisPd = useMemo(() => {
     const real = pd.filter(
-      (r) => Number(r.totalAssets) !== Number(r.prevAssets)
+      (r) => r.effReturnRate !== null && r.effReturnRate !== undefined
     );
     return real.length >= 4 ? real : pd;
   }, [pd]);
@@ -1392,15 +1850,43 @@ export default function App() {
   const retDist = useMemo(() => getReturnDist(basisPd), [basisPd, isDark]);
   const winRate = useMemo(() => {
     const t = basisPd.length;
-    return t ? (basisPd.filter((r) => r.returnRate > 0).length / t) * 100 : 0;
+    return t ? (basisPd.filter((r) => statRet(r) > 0).length / t) * 100 : 0;
   }, [basisPd]);
   // 有效事件：月份 1~600、金額非零才進模擬（輸入框內的半成品不觸發重算）
+  // 以序列化字串為中介：useMemo 依賴比較是 reference 相等，若直接依賴 scenarioEvents，
+  // 每個字元都會產生新陣列 reference、讓下游兩個 Monte Carlo（scenarioSim/fireSim）白跑；
+  // 先算出字串 key，內容不變時 activeEvents 沿用舊 reference，註解宣稱的行為才真正成立
+  const activeEventsKey = useMemo(
+    () =>
+      JSON.stringify(
+        scenarioEvents
+          .map((e) => ({
+            month: Math.round(Number(e.month)),
+            amount: Number(e.amount),
+          }))
+          .filter(
+            (e) =>
+              e.month >= 1 &&
+              e.month <= 600 &&
+              Number.isFinite(e.amount) &&
+              e.amount !== 0
+          )
+      ),
+    [scenarioEvents]
+  );
   const activeEvents = useMemo(
+    () => JSON.parse(activeEventsKey),
+    [activeEventsKey]
+  );
+  // 事件標記（含名稱）：僅供情境圖 ReferenceLine 顯示。label 刻意不進 activeEventsKey——
+  // 改名的每個字元不該重跑兩個 Monte Carlo（穩定 reference 優化），月份/金額變動仍會觸發
+  const activeEventMarkers = useMemo(
     () =>
       scenarioEvents
         .map((e) => ({
           month: Math.round(Number(e.month)),
           amount: Number(e.amount),
+          label: String(e.label || ""),
         }))
         .filter(
           (e) =>
@@ -1438,23 +1924,28 @@ export default function App() {
   );
   const scenarios = scenarioSim ? scenarioSim.scenarios : [];
   const scenarioDefaults = useMemo(() => getScenarioStats(pd), [pd]);
-  const scData = useMemo(
-    () =>
-      scenarios.length && latest
-        ? scenarios[0].points.map((_, i) => {
-            const o = {
-              month: i,
-              label:
-                i === 0 ? fmtMS(latest.month) : fmtMS(addMonths(latest.month, i)),
-            };
-            scenarios.forEach((s) => {
-              o[s.key] = s.points[i]?.value || 0;
-            });
-            return o;
-          })
-        : [],
-    [scenarios, latest]
-  );
+  const scData = useMemo(() => {
+    if (!(scenarios.length && latest)) return [];
+    const infl = Math.min(5, Math.max(0, Number(inflationPct) || 0)) / 100;
+    return scenarios[0].points.map((_, i) => {
+      // 實質模式：名目路徑折回今日購買力，20 年後的數字才不會高估實際生活水準；
+      // 「目標」與「現在」同樣折算成隨時間遞減的曲線（固定名目金額的實質價值會縮水）
+      const defl = scenarioReal ? Math.pow(1 + infl, i / 12) : 1;
+      const o = {
+        month: i,
+        label:
+          i === 0 ? fmtMS(latest.month) : fmtMS(addMonths(latest.month, i)),
+      };
+      scenarios.forEach((s) => {
+        o[s.key] = (s.points[i]?.value || 0) / defl;
+      });
+      if (scenarioReal) {
+        o.nowReal = (latest.totalAssets || 0) / defl;
+        if (goalValue > 0) o.goalReal = goalValue / defl;
+      }
+      return o;
+    });
+  }, [scenarios, latest, scenarioReal, inflationPct, goalValue]);
   // 各情境何時達標（points index；-1 = 模擬期間內未達標）
   const scenarioGoalReach = useMemo(() => {
     if (!goalValue || !scenarios.length) return null;
@@ -1476,7 +1967,7 @@ export default function App() {
       total: scenarioSim.paths.length,
     };
   }, [scenarioSim, goalValue]);
-  // 成長貢獻分解：總資產 = 起始資產 + 累計投入 + 累計報酬
+  // 成長貢獻分解：總資產 = 起始資產 + 累計投入 + 累計淨增值（與 KPI 的「淨增值」同口徑）
   const contribData = useMemo(() => {
     if (pd.length < 2) return null;
     const base = pd[0].totalAssets;
@@ -1516,17 +2007,25 @@ export default function App() {
       .sort((a, b) => Number(b) - Number(a))
       .map((year) => ({ year, months: map[year] }));
   }, [pd]);
-  // 年化報酬（TWR）：報酬鏈用有效月份，年化期間用實際經過月數
+  // 年化報酬（TWR）：報酬鏈用結轉後的有效月報酬（停滯月流量結轉，與年度卡、
+  // 分析頁累積報酬圖同口徑，期末值必相等）；年化期間用首末紀錄的實際日曆月差——
+  // 用紀錄筆數會在整月漏登時使 12/n 放大、年化被高估
   const twrStats = useMemo(() => {
-    const chain = basisPd.reduce(
-      (f, r) => f * (1 + Number(r.returnRate || 0) / 100),
+    if (!pd.length) return { cum: 0, ann: 0 };
+    const chain = pd.reduce(
+      (f, r) =>
+        r.effReturnRate === null || r.effReturnRate === undefined
+          ? f
+          : f * (1 + Number(r.effReturnRate) / 100),
       1
     );
     const cum = (chain - 1) * 100;
-    const n = Math.max(1, pd.length - 1);
+    const [fy, fm] = String(pd[0].month).split("-").map(Number);
+    const [ly, lm] = String(pd[pd.length - 1].month).split("-").map(Number);
+    const n = Math.max(1, (ly - fy) * 12 + (lm - fm));
     const ann = chain > 0 ? (Math.pow(chain, 12 / n) - 1) * 100 : 0;
     return { cum, ann };
-  }, [basisPd, pd]);
+  }, [pd]);
   // ── FIRE 設定與計算 ──
   // 提領率可選 4%／3.5%／3.25%（×25／×28.6／×30.8）：4% 法則以 30 年退休期回測，
   // 提早退休（40 年以上）學界普遍建議 3.25~3.5%。選擇存在本機。
@@ -1549,21 +2048,28 @@ export default function App() {
     const annual = (Math.pow(1 + mu / 100, 12) - 1) * 100;
     return annual > 10 ? { mu, annual } : null;
   }, [scenarioRate, scenarioDefaults]);
-  // FIRE：自由數字＝(年支出 − 退休後年收) × (100/提領率)，達標門檻隨 2% 通膨逐月成長。
+  // FIRE：自由數字＝(年支出 − 退休後年收) × 稅費加成 × (100/提領率)，
+  // 達標門檻隨使用者設定的通膨（與情境模擬共用）逐月成長。
   // 退休後年收＝分紅、退休金等退休後仍會持續的被動收入，視為與通膨同步成長
   //（固定名目金額的年金會略被高估）；有負債時起點與進度用淨值
-  const fireStats = useMemo(() => {
-    if (!fireExpense || fireExpense <= 0 || !latest) return null;
-    const INFL = 0.02;
+  // 年支出／退休後年收在門檻計算前先防抖：拆分後單次重算已便宜，
+  // 但仍會帶動整個分頁重繪，比照滑桿走 150ms 防抖
+  const debFireExpense = useDebouncedValue(fireExpense, 150);
+  const debFirePassive = useDebouncedValue(firePassive, 150);
+  // Monte Carlo 模擬與門檻計算拆開：模擬結果只依賴 pd/latest/滑桿/事件，
+  // 完全不吃年支出／退休後年收／提領率／稅費係數／通膨——那些每個字元變動時
+  // 不該重跑 500 路徑 × 600 個月的模擬，只需重算便宜的門檻
+  //（模擬路徑是名目值，通膨只作用在門檻與顯示層）。
+  // fireSimActive 用布林值 gating：只在「未使用 ↔ 使用中」切換時才觸發模擬，
+  // 沒填年支出的使用者維持原本「完全不跑這支模擬」的行為
+  const fireSimActive = !!latest && Number(debFireExpense) > 0;
+  const fireSim = useMemo(() => {
+    if (!fireSimActive) return null;
     const HORIZON = 600; // 最長推算 50 年：不再顯示「未達成」，一律給出實際落點
-    const multiple = 100 / fireSwr;
-    const passive = Math.max(0, firePassive || 0);
-    const netExpense = Math.max(0, fireExpense - passive);
-    const covered = netExpense <= 0; // 被動收入已覆蓋全部年支出
-    const fireNumber = Math.round(netExpense * multiple);
-    const usesNetWorth = Number(latest.liabilities || 0) > 0;
-    const base = usesNetWorth ? latest.netWorth : latest.totalAssets;
-    const sim = projectScenarios(
+    // 有負債時起點用淨值（與下方 fireStats 的 usesNetWorth 判斷一致）
+    const base =
+      Number(latest.liabilities || 0) > 0 ? latest.netWorth : latest.totalAssets;
+    return projectScenarios(
       pd,
       Math.max(0, base),
       HORIZON,
@@ -1573,6 +2079,31 @@ export default function App() {
       debScenarioInflowGrowth,
       activeEvents
     );
+  }, [
+    fireSimActive,
+    latest,
+    pd,
+    debScenarioRate,
+    debScenarioInflow,
+    debScenarioSigma,
+    debScenarioInflowGrowth,
+    activeEvents,
+  ]);
+  const fireStats = useMemo(() => {
+    if (!debFireExpense || debFireExpense <= 0 || !latest || !fireSim)
+      return null;
+    // 達成門檻隨使用者設定的通膨逐月成長（與情境模擬共用 agwr_inflation，限 0~5%）
+    const INFL = Math.min(5, Math.max(0, Number(inflationPct) || 0)) / 100;
+    const multiple = 100 / fireSwr;
+    const passive = Math.max(0, debFirePassive || 0);
+    // 提領毛額＝生活費淨缺口 × 加成係數：美股預扣、台股股利稅與二代健保都吃在提領端
+    const netExpense =
+      Math.max(0, debFireExpense - passive) * (fireTaxFactor || 1);
+    const covered = netExpense <= 0; // 被動收入已覆蓋全部年支出
+    const fireNumber = Math.round(netExpense * multiple);
+    const usesNetWorth = Number(latest.liabilities || 0) > 0;
+    const base = usesNetWorth ? latest.netWorth : latest.totalAssets;
+    const sim = fireSim;
     const targetAt = (i) => fireNumber * Math.pow(1 + INFL, i / 12);
     const reach = sim.scenarios.map((s) => ({
       key: s.key,
@@ -1605,16 +2136,13 @@ export default function App() {
           : 100,
     };
   }, [
-    fireExpense,
-    firePassive,
+    debFireExpense,
+    debFirePassive,
+    fireTaxFactor,
     fireSwr,
+    inflationPct,
     latest,
-    pd,
-    debScenarioRate,
-    debScenarioInflow,
-    debScenarioSigma,
-    debScenarioInflowGrowth,
-    activeEvents,
+    fireSim,
   ]);
   const goalStats = useMemo(() => {
     if (!goalValue || !latest) return null;
@@ -1647,6 +2175,7 @@ export default function App() {
         investedAssets: 0,
         lastMonth: "-",
         latestReturn: 0,
+        latestIsStale: false,
         latestNetGain: 0,
         monthlyChange: 0,
         ytdAssetGrowth: 0,
@@ -1670,31 +2199,33 @@ export default function App() {
     const md = Math.min(...pd.map((r) => r.drawdown), 0),
       ath = Math.max(...pd.map((r) => r.totalAssets), 0);
     const athD = ath > 0 ? ((latest.totalAssets - ath) / ath) * 100 : 0;
-    // 連勝／均報酬／波動度用有效月份（basisPd），避免未更新月份的假負報酬污染
+    // 連勝／均報酬／波動度用有效月份（basisPd）＋有效報酬值（statRet）：
+    // 只排除停滯月不夠——恢復月的 raw returnRate 仍把結轉入金記成報酬（假勝月），
+    // 取 effReturnRate 才是合併口徑的真實損益
     let ws = 0;
     for (let i = basisPd.length - 1; i >= 0; i--) {
-      if (basisPd[i].returnRate > 0) ws++;
+      if (statRet(basisPd[i]) > 0) ws++;
       else break;
     }
     let lws = 0;
     if (ws === 0) {
       let c = false;
       for (let i = basisPd.length - 2; i >= 0; i--) {
-        if (!c && basisPd[i].returnRate <= 0) {
+        if (!c && statRet(basisPd[i]) <= 0) {
           c = true;
           continue;
         }
-        if (c && basisPd[i].returnRate > 0) lws++;
+        if (c && statRet(basisPd[i]) > 0) lws++;
         else if (c) break;
       }
     }
     const l6 = basisPd.slice(-6),
-      a6 = l6.reduce((a, c) => a + c.returnRate, 0) / (l6.length || 1);
+      a6 = l6.reduce((a, c) => a + statRet(c), 0) / (l6.length || 1);
     const cr =
       latest.totalAssets > 0
         ? (latest.cashAssets / latest.totalAssets) * 100
         : 0;
-    const rets = basisPd.map((r) => r.returnRate),
+    const rets = basisPd.map((r) => statRet(r)),
       ar = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
     const vol = Math.sqrt(
       rets.reduce((s, r) => s + (r - ar) ** 2, 0) / (rets.length || 1)
@@ -1705,6 +2236,11 @@ export default function App() {
       investedAssets: latest.investedAssets,
       lastMonth: latest.month,
       latestReturn: latest.returnRate,
+      // 最新月為停滯月（有出入金但總資產未更新）：raw returnRate 是「−淨流量」
+      // 造出的假報酬，KPI 與判讀（TERMINAL SIGNAL）都不該拿它當本月表現
+      latestIsStale:
+        Number(latest.prevAssets) > 0 &&
+        Number(latest.totalAssets) === Number(latest.prevAssets),
       latestNetGain: latest.netGain,
       monthlyChange: latest.totalChange,
       ytdAssetGrowth: ytd,
@@ -1729,14 +2265,14 @@ export default function App() {
     if (!formData.totalAssets || Number(formData.totalAssets) <= 0)
       e.push("總資產>0");
     if (Number(formData.cashAssets || 0) < 0) e.push("現金≥0");
-    if (Number(formData.netIn || 0) < 0) e.push("淨投入≥0");
-    if (Number(formData.netOut || 0) < 0) e.push("淨提領≥0");
+    if (Number(formData.netIn || 0) < 0) e.push("投入金額≥0");
+    if (Number(formData.netOut || 0) < 0) e.push("提領金額≥0");
     if (Number(formData.liabilities || 0) < 0) e.push("負債≥0");
     if (
       Number(formData.cashAssets || 0) + Number(formData.otherAssets || 0) >
       Number(formData.totalAssets || 0)
     )
-      e.push("現金+其它≤總資產");
+      e.push("現金+其他≤總資產");
     return e;
   }, [formData]);
   const tableData = useMemo(() => {
@@ -1788,12 +2324,14 @@ export default function App() {
     };
   }, [formData, records]);
   const gapWarning = useMemo(() => {
+    // 範例資料本來就停在過去月份，催「補登」只會誤導新使用者把範例當成該維護的真資料
+    if (isExampleRecords) return null;
     if (!latest) return null;
     const [y, m] = latest.month.split("-").map(Number);
     const d =
       (new Date().getFullYear() - y) * 12 + (new Date().getMonth() - (m - 1));
     return d > 1 ? d : null;
-  }, [latest]);
+  }, [latest, isExampleRecords]);
   // 備份提醒：JSON 完整備份超過 60 天（或從未備份）時顯示橫幅；「稍後」暫緩 30 天。
   // 雲端是共用文件不等於備份——本機留檔是資料災難的最後保險
   const backupDue = useMemo(() => {
@@ -1818,8 +2356,13 @@ export default function App() {
     if (stats.athDistance >= -1 && stats.athDistance < 0)
       return "距歷史高點不到 1%，有望突破。";
     if (stats.athDistance >= 0) return "已創新高。保持節奏，檢視配置。";
-    if (stats.latestReturn >= 3) return "本月報酬突出，短期動能偏正。";
-    if (stats.latestReturn < 0 && stats.maxDrawdown < -5)
+    // 最新月停滯時跳過「本月報酬」相關判讀：raw returnRate 只是出入金的鏡像
+    //（假報酬），拿它說「動能偏正／回檔」會誤導；其餘分支不依賴本月報酬，照常判讀
+    if (!stats.latestIsStale && stats.latestReturn >= 3)
+      return "本月報酬突出，短期動能偏正。";
+    // 用「當前回撤」而非史上最大回撤：否則歷史上只要跌過一次 >5%，
+    // 之後任何距高點 1% 的小跌都會被誤判成回檔區間
+    if (!stats.latestIsStale && stats.latestReturn < 0 && latest.drawdown < -5)
       return "回檔區間。優先看現金彈性。";
     if (stats.ytdAssetGrowth < 0) return "YTD 尚未回正。追蹤投入節奏。";
     return "結構偏穩，持續追蹤同步變化。";
@@ -1835,6 +2378,11 @@ export default function App() {
   const hmSelData = useMemo(
     () => (hmSel ? pd.find((r) => r.month === hmSel) || null : null),
     [hmSel, pd]
+  );
+  // 有手寫備註的月份才上圖標記：範例資料的「歷史資料導入」不算故事，排除避免滿版圖釘
+  const notedTrend = useMemo(
+    () => trendData.filter((r) => r.note && r.note !== "歷史資料導入"),
+    [trendData]
   );
 
   const applySave = (c, existed) => {
@@ -1855,9 +2403,8 @@ export default function App() {
       month: formData.month,
       totalAssets: Number(formData.totalAssets || 0),
       cashAssets:
-        formData.cashAssets === ""
-          ? defaultCashByMonth(formData.month)
-          : Number(formData.cashAssets || 0),
+        // 留空即為 0，不再依月份默默補值
+        formData.cashAssets === "" ? 0 : Number(formData.cashAssets || 0),
       otherAssets: Number(formData.otherAssets || 0),
       netIn: Number(formData.netIn || 0),
       netOut: Number(formData.netOut || 0),
@@ -1888,9 +2435,12 @@ export default function App() {
         message: `正在編輯 ${editingMonth}，月份已改為 ${c.month}。「移動」會刪除 ${editingMonth} 的原紀錄${
           ex ? `並覆蓋 ${c.month} 現有資料` : ""
         }；「另存」則保留原紀錄、另外新增一筆。${fatFingerMsg}`,
-        confirmLabel: "移動",
-        secondaryLabel: "另存",
-        onConfirm: () => {
+        // 主按鈕給非破壞性的「另存」——「移動」會刪原紀錄且無 undo，不該是預設動作
+        variant: "normal",
+        confirmLabel: "另存",
+        secondaryLabel: "移動",
+        onConfirm: () => applySave(c, ex),
+        onSecondary: () => {
           setRecords((p) =>
             normalizeRecords([
               ...p.filter(
@@ -1902,7 +2452,6 @@ export default function App() {
           setEditingMonth(c.month);
           setToast(`已移動至 ${c.month}`);
         },
-        onSecondary: () => applySave(c, ex),
       });
       return;
     }
@@ -1910,6 +2459,7 @@ export default function App() {
       setConfirmDlg({
         title: "覆蓋紀錄",
         message: `${c.month} 已有資料，確定要覆蓋嗎？原數值將被取代。${fatFingerMsg}`,
+        variant: "normal",
         onConfirm: () => applySave(c, true),
       });
       return;
@@ -1918,6 +2468,7 @@ export default function App() {
       setConfirmDlg({
         title: "數字變動異常",
         message: `${fatFingerMsg}確定要儲存嗎？`,
+        variant: "normal",
         confirmLabel: "確定儲存",
         onConfirm: () => applySave(c, ex),
       });
@@ -1933,6 +2484,97 @@ export default function App() {
     setCloudState("同步中...");
     try {
       const { db } = getFirebaseServices();
+      // 雲端資料從未成功載入（監聽失敗）時不可直接 setDoc：此時本地可能只是
+      // 種子資料＋goal 0，直接上傳會把較新的雲端整份換掉並傳播到所有裝置。
+      // 先一次性讀取確認 hydration，讀到資料就套用（同 snapshot 語意），
+      // 只有雲端真的沒資料才允許以本地內容初始化
+      if (!remoteAppliedRef.current) {
+        const snap = await getDoc(doc(db, CLOUD_DOC_PATH[0], CLOUD_DOC_PATH[1]));
+        const rr = snap.exists() ? snap.data()?.records : null;
+        const recs = Array.isArray(rr) ? normalizeRecords(rr) : null;
+        if (recs && recs.length) {
+          const rj = JSON.stringify(recs);
+          const prevRemoteJson = remoteJsonRef.current;
+          const remoteAt = Number(snap.data()?.updatedAtClient || 0);
+          remoteJsonRef.current = rj;
+          const rg = snap.data()?.goalValue;
+          if (rg != null) {
+            const nv = Number(rg) || 0;
+            if (localGoalRef.current === remoteGoalRef.current) {
+              setGoalInput(nv ? String(nv) : "");
+              setGoalValue(nv);
+            }
+            remoteGoalRef.current = nv;
+          }
+          const rf = snap.data()?.fireExpense;
+          if (rf != null) {
+            const nv = Number(rf) || 0;
+            if (localFireRef.current === remoteFireRef.current) {
+              setFireInput(nv ? String(nv) : "");
+              setFireExpense(nv);
+            }
+            remoteFireRef.current = nv;
+          }
+          const fp = snap.data()?.firePassiveIncome;
+          if (fp != null) {
+            const nv = Number(fp) || 0;
+            if (localPassiveRef.current === remotePassiveRef.current) {
+              setFirePassiveInput(nv ? String(nv) : "");
+              setFirePassive(nv);
+            }
+            remotePassiveRef.current = nv;
+          }
+          // 稅費係數／一次性事件與 snapshot handler 同語意套用：漏掉的話
+          // remoteRef 停留在本地值，下次上傳（含全部欄位）會以本地預設蓋掉雲端
+          const rt = snap.data()?.fireTaxFactor;
+          if (rt != null) {
+            const nv = Number(rt);
+            const f = nv > 1 && nv <= 2 ? nv : 1;
+            if (localTaxRef.current === remoteTaxRef.current) {
+              setFireTaxInput(f > 1 ? String(f) : "");
+              setFireTaxFactor(f);
+            }
+            remoteTaxRef.current = f;
+          }
+          const se = snap.data()?.scenarioEvents;
+          if (Array.isArray(se)) {
+            const norm = normalizeScenarioEvents(se);
+            const js = JSON.stringify(norm);
+            if (js !== remoteEventsRef.current) {
+              if (localEventsRef.current === remoteEventsRef.current)
+                setScenarioEvents(norm);
+              remoteEventsRef.current = js;
+            }
+          }
+          setRecords((cur) => {
+            const curJson = JSON.stringify(normalizeRecords(cur));
+            if (curJson === rj) return cur;
+            // 與 snapshot 相同的覆蓋守衛：斷線期間的本地編輯較新時保留本地，
+            // 防抖 effect 會把差異補傳上雲
+            if (
+              curJson !== prevRemoteJson &&
+              remoteAt < lastLocalEditAtRef.current
+            )
+              return cur;
+            try {
+              localStorage.setItem(
+                STORAGE_KEY + "_conflict_backup",
+                JSON.stringify({
+                  records: normalizeRecords(cur),
+                  updatedAt: Date.now(),
+                })
+              );
+            } catch {}
+            persistLocal(recs);
+            return recs;
+          });
+          remoteAppliedRef.current = true;
+          setCloudReady(true);
+          setCloudState("已連線");
+          setToast("已重新載入雲端資料");
+          return;
+        }
+      }
       const n = normalizeRecords(records);
       await setDoc(
         doc(db, CLOUD_DOC_PATH[0], CLOUD_DOC_PATH[1]),
@@ -1941,6 +2583,8 @@ export default function App() {
           goalValue: goalValue || 0,
           fireExpense: fireExpense || 0,
           firePassiveIncome: firePassive || 0,
+          fireTaxFactor: fireTaxFactor || 1,
+          scenarioEvents: normalizeScenarioEvents(scenarioEvents),
           updatedAt: serverTimestamp(),
           updatedAtClient: Date.now(),
           updatedBy: cloudUid || "anon",
@@ -1953,6 +2597,10 @@ export default function App() {
       remoteGoalRef.current = goalValue || 0;
       remoteFireRef.current = fireExpense || 0;
       remotePassiveRef.current = firePassive || 0;
+      remoteTaxRef.current = fireTaxFactor || 1;
+      remoteEventsRef.current = JSON.stringify(
+        normalizeScenarioEvents(scenarioEvents)
+      );
       setCloudReady(true);
       remoteAppliedRef.current = true;
       setCloudState("已同步");
@@ -1993,6 +2641,30 @@ export default function App() {
     setUndoDels((p) => p.filter((u) => u.id !== uid));
     setToast(`已復原 ${t.record.month}`);
   };
+  // 清空全部紀錄：新使用者從範例過渡到自有資料的主要入口；
+  // 真實資料清空前沿用 downloadPreActionBackup 自動備份，按錯仍有後悔藥
+  const handleClearAll = () => {
+    if (!records.length) {
+      setToast("目前沒有紀錄");
+      return;
+    }
+    setShowDataModal(false);
+    setConfirmDlg({
+      title: "清空全部紀錄",
+      message: isExampleRecords
+        ? `將清空 ${records.length} 筆範例資料，之後即可開始記錄你自己的資產。`
+        : `將清空全部 ${records.length} 筆紀錄。執行前會自動下載一份當前 JSON 備份，日後仍可由該檔案還原。`,
+      confirmLabel: "清空全部",
+      onConfirm: () => {
+        // 範例資料沒有備份價值，跳過自動備份、避免多一個無用下載
+        if (!isExampleRecords) downloadPreActionBackup("clear-all");
+        setRecords([]);
+        resetForm();
+        setShowForm(false);
+        setToast("已清空全部紀錄");
+      },
+    });
+  };
   // ── 匯入／備份／還原 ──
   const handleImportCSV = (file) => {
     const reader = new FileReader();
@@ -2011,6 +2683,7 @@ export default function App() {
         message: `將匯入 ${rows.length} 筆（${rows[0].month} ~ ${
           rows[rows.length - 1].month
         }），其中 ${dup} 筆與現有月份重複、將被覆蓋。執行前會自動下載一份當前備份。`,
+        variant: "normal",
         onConfirm: () => {
           downloadPreActionBackup("csv-import");
           setRecords((p) => {
@@ -2036,6 +2709,7 @@ export default function App() {
       goalValue: goalValue || 0,
       fireExpense: fireExpense || 0,
       firePassiveIncome: firePassive || 0,
+      fireTaxFactor: fireTaxFactor || 1,
       records: normalizeRecords(records),
       allocation,
     };
@@ -2081,6 +2755,7 @@ export default function App() {
               ? `資產配置（${p.allocation.assets.length} 項）也會一併還原。`
               : ""
           }執行前會自動下載一份當前備份。`,
+          variant: "normal",
           onConfirm: async () => {
             downloadPreActionBackup("restore");
             setRecords(recs);
@@ -2095,6 +2770,13 @@ export default function App() {
             if (p.firePassiveIncome) {
               setFirePassiveInput(String(p.firePassiveIncome));
               setFirePassive(Number(p.firePassiveIncome));
+            }
+            if (p.fireTaxFactor) {
+              const n = Number(p.fireTaxFactor);
+              if (n > 1 && n <= 2) {
+                setFireTaxInput(String(n));
+                setFireTaxFactor(n);
+              }
             }
             // 資產配置：直接寫回其雲端文件，分頁的 onSnapshot 會即時同步
             if (p.allocation && Array.isArray(p.allocation.assets)) {
@@ -2112,9 +2794,17 @@ export default function App() {
                       ? p.allocation.categoryOrder
                       : DEFAULT_CATEGORY_ORDER,
                     updatedAt: new Date().toISOString(),
+                    updatedAtClient: Date.now(),
                   }
                 );
-              } catch {}
+              } catch {
+                // 失敗不能靜默：此時月度紀錄已還原、資產配置沒跟上，
+                // 兩份資料自此不一致，使用者必須知道差在哪一半
+                setToast(
+                  "紀錄已還原；資產配置雲端寫入失敗，請連線後重新還原一次"
+                );
+                return;
+              }
             }
             setToast("已還原備份");
           },
@@ -2130,7 +2820,7 @@ export default function App() {
     setFormData({
       month: row.month,
       totalAssets: String(row.totalAssets ?? ""),
-      cashAssets: String(row.cashAssets ?? defaultCashByMonth(row.month)),
+      cashAssets: String(row.cashAssets ?? 0),
       otherAssets: String(row.otherAssets ?? 0),
       netIn: String(row.netIn ?? 0),
       netOut: String(row.netOut ?? 0),
@@ -2144,13 +2834,11 @@ export default function App() {
     setEditingMonth("");
     setHasSubmitted(false);
     const m = getCurrentMonth();
-    // 預設帶上月的現金／其它／淨投入，每月記帳只需改總資產
+    // 預設帶上月的現金／其他／投入金額，每月記帳只需改總資產
     setFormData({
       month: m,
       totalAssets: "",
-      cashAssets: latest
-        ? String(latest.cashAssets)
-        : String(defaultCashByMonth(m)),
+      cashAssets: latest ? String(latest.cashAssets) : "0",
       otherAssets: latest ? String(latest.otherAssets) : "0",
       netIn: latest ? String(latest.netIn) : "0",
       netOut: "0",
@@ -2239,7 +2927,8 @@ export default function App() {
   return (
     <div className="app-root">
       <style>{css}</style>
-      <div className="toast-host">
+      {/* aria-live 讓螢幕閱讀器唸出通知，尤其刪除復原只有 6 秒窗口，靜默等於資料無聲消失 */}
+      <div className="toast-host" role="status" aria-live="polite">
         {toast && (
           <div className="toast">
             {toast}
@@ -2275,6 +2964,7 @@ export default function App() {
           title={confirmDlg.title}
           message={confirmDlg.message}
           confirmLabel={confirmDlg.confirmLabel}
+          variant={confirmDlg.variant}
           secondaryLabel={confirmDlg.secondaryLabel}
           onSecondary={confirmDlg.onSecondary}
           onConfirm={confirmDlg.onConfirm}
@@ -2283,6 +2973,7 @@ export default function App() {
       )}
       {showDataModal && (
         <div
+          ref={dataModalTrapRef}
           className="modal-overlay"
           role="dialog"
           aria-modal="true"
@@ -2338,10 +3029,23 @@ export default function App() {
                 還原 JSON 備份
                 <span className="data-hint">完全取代現有資料</span>
               </button>
+              <button
+                className="btn-ghost data-action"
+                style={{ color: T.negative }}
+                onClick={handleClearAll}
+              >
+                <Trash2 size={15} />
+                清空全部紀錄
+                <span className="data-hint">
+                  {isExampleRecords ? "移除範例資料" : "清空前自動下載備份"}
+                </span>
+              </button>
             </div>
             <div className="modal-actions" style={{ marginTop: 16 }}>
+              {/* 焦點預設放「關閉」：開啟後焦點若留在 header 觸發鈕，鍵盤使用者摸不到 modal 內容 */}
               <button
                 className="modal-cancel"
+                autoFocus
                 onClick={() => setShowDataModal(false)}
               >
                 關閉
@@ -2381,14 +3085,24 @@ export default function App() {
           <h1 className="header-title">資產成長戰情室</h1>
         </div>
         <div className="header-right">
-          <div className="cloud-status" style={{ color: cloudColor }}>
+          <div
+            className="cloud-status"
+            style={{ color: cloudColor }}
+            // 原始錯誤碼對一般使用者無意義，收進 title 供除錯；畫面只講後果與現況
+            title={cloudState.includes("失敗") ? cloudState : undefined}
+          >
             {cloudIcon}
-            <span>{cloudState}</span>
+            <span>
+              {cloudState.includes("失敗")
+                ? "雲端暫時無法連線，資料已存在本機"
+                : cloudState}
+            </span>
           </div>
           {authReady && cloudState.includes("失敗") && (
             <button className="btn-ghost" onClick={handleForceSync}>
               <RefreshCw size={14} />
-              重試
+              {/* 未 hydration 時按下去是「先讀雲端」而非上傳，文案跟著行為走 */}
+              {remoteAppliedRef.current ? "重試" : "重新連線"}
             </button>
           )}
           <button
@@ -2399,6 +3113,9 @@ export default function App() {
             style={{ padding: "8px 12px" }}
           >
             {privacy ? <EyeOff size={16} /> : <Eye size={16} />}
+            <span className="privacy-label">
+              {privacy ? "已隱藏" : "隱私"}
+            </span>
           </button>
           <button
             className="btn-ghost theme-toggle"
@@ -2415,8 +3132,19 @@ export default function App() {
           <button
             className="btn-primary"
             onClick={() => {
-              setShowForm(!showForm);
-              if (!showForm) resetForm();
+              if (showForm) {
+                setShowForm(false);
+                return;
+              }
+              // 當月已有紀錄時直接載入編輯：避免空白表單存檔時多一層覆蓋確認，
+              // 且覆蓋會把既有備註／提領金額換成預設值
+              const cur = records.find((r) => r.month === getCurrentMonth());
+              if (cur) {
+                handleEdit(cur);
+              } else {
+                resetForm();
+                setShowForm(true);
+              }
             }}
           >
             {showForm ? (
@@ -2454,6 +3182,20 @@ export default function App() {
         ))}
       </nav>
 
+      {/* 範例資料橫幅：放在分頁之外讓五個分頁都看得到；清空後 isExampleRecords 轉 false 自動消失 */}
+      {isExampleRecords && (
+        <div className="stale-banner si si-0" role="status">
+          <AlertCircle size={15} />
+          <span>
+            <strong>目前顯示的是範例資料</strong>
+            ——可先隨意探索各分頁功能，資料不會上傳雲端；準備好就從這裡開始記錄自己的資產。
+          </span>
+          <button className="btn-ghost" onClick={handleClearAll}>
+            清空範例、開始記帳
+          </button>
+        </div>
+      )}
+
       <ErrorBoundary resetKey={activeTab}>
       {showForm && (
         <section className="card form-card stagger-in" key="form">
@@ -2465,6 +3207,10 @@ export default function App() {
               <p className="card-desc">
                 上次：{latest?.month || "—"} ／{" "}
                 {mask(`NT$ ${fmtN(latest?.totalAssets || 0)}`)}
+              </p>
+              {/* 口徑總說明：欄位 tooltip 手機看不到，這行是觸控裝置唯一的口徑線索 */}
+              <p className="card-desc">
+                投資資產＝總資產−現金−其他資產，自動計算；「投入／提領」指與外部的資金進出，不是買賣金額。
               </p>
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -2516,40 +3262,53 @@ export default function App() {
                 value={formData.totalAssets}
                 onChange={(v) => setFormData((p) => ({ ...p, totalAssets: v }))}
                 big
+                privacy={privacy}
+                tip="這個月月底所有資產的市值總和（含現金與其他資產），須大於等於現金＋其他"
               />
               <FF
                 label="現金資產"
                 type="number"
                 value={formData.cashAssets}
                 onChange={(v) => setFormData((p) => ({ ...p, cashAssets: v }))}
+                privacy={privacy}
+                tip="活存、定存等隨時可動用的現金部位；留空視為 0"
               />
               <FF
-                label="其它資產"
+                label="其他資產"
                 type="number"
                 value={formData.otherAssets}
                 onChange={(v) => setFormData((p) => ({ ...p, otherAssets: v }))}
+                privacy={privacy}
+                tip="不屬於投資也不是現金的資產（保單現值、黃金等）；投資資產＝總資產−現金−其他，自動計算"
               />
               <FF
-                label="淨投入"
+                label="投入金額"
                 type="number"
                 value={formData.netIn}
                 onChange={(v) => setFormData((p) => ({ ...p, netIn: v }))}
+                privacy={privacy}
+                tip="本月從外部新投入的資金（如薪水轉入），不是買股金額；報酬率計算會排除這筆出入金"
               />
               <FF
-                label="淨提領"
+                label="提領金額"
                 type="number"
                 value={formData.netOut}
                 onChange={(v) => setFormData((p) => ({ ...p, netOut: v }))}
+                privacy={privacy}
+                tip="本月從資產提出到外部花用的金額（如生活費），賣股後留在帳上不算提領"
               />
               <FF
                 label="負債(選填)"
                 type="number"
                 value={formData.liabilities}
                 onChange={(v) => setFormData((p) => ({ ...p, liabilities: v }))}
+                privacy={privacy}
               />
               <div className="form-field">
-                <label className="field-label">備註</label>
+                {/* 主 App 只會渲染一份此表單，固定 id 即可完成 label 關聯 */}
+                <label className="field-label" htmlFor="record-note-input">備註</label>
                 <input
+                  id="record-note-input"
                   className="field-input"
                   placeholder="市場回檔、保單、黃金..."
                   value={formData.note}
@@ -2577,7 +3336,7 @@ export default function App() {
                     v={mask(`NT$ ${fmtN(formPreview.investedAssets)}`)}
                   />
                   <PRow
-                    l="推估報酬"
+                    l="推估淨增值"
                     v={mask(`NT$ ${fmtD(formPreview.netGain)}`)}
                     c={formPreview.netGain >= 0 ? T.positive : T.negative}
                   />
@@ -2592,6 +3351,12 @@ export default function App() {
                 </div>
               ) : (
                 <div className="preview-empty">請輸入總資產</div>
+              )}
+              {/* 未來月份多半是手滑選錯年：存入後 latest 變未來月、YTD 與缺月警示全部失真。只警示不阻擋 */}
+              {formData.month > getCurrentMonth() && (
+                <div className="alert alert-warn" role="alert">
+                  {formData.month} 是未來月份，存入後統計將以該月為最新，請確認沒有選錯年月。
+                </div>
               )}
               <button className="btn-save" onClick={handleSave}>
                 <Save size={16} />
@@ -2726,24 +3491,41 @@ export default function App() {
           <section className="kpi-strip si si-1">
             <div className="kpi-item">
               <div className="kpi-label">月報酬率</div>
-              <div
-                className="kpi-value mono"
-                style={{
-                  color: stats.latestReturn >= 0 ? T.positive : T.negative,
-                }}
-              >
-                <AnimV
-                  value={stats.latestReturn}
-                  fmt={(v) => `${v.toFixed(2)}%`}
-                />
-              </div>
-              <div className="kpi-sub">
-                淨增值{" "}
-                <AnimV
-                  value={stats.latestNetGain}
-                  fmt={(v) => (privacy ? "＊＊＊" : fmtS(v))}
-                />
-              </div>
+              {/* 最新月停滯（總資產未更新、只有出入金）：raw returnRate 是
+                  「−淨流量」造出的假報酬，顯示數字會誤導，改顯示「—」並說明；
+                  淨增值同為假值（＝−淨流量鏡像）一併隱藏 */}
+              {stats.latestIsStale ? (
+                <>
+                  <div
+                    className="kpi-value mono"
+                    style={{ color: T.textTertiary }}
+                  >
+                    —
+                  </div>
+                  <div className="kpi-sub">本月未更新總資產</div>
+                </>
+              ) : (
+                <>
+                  <div
+                    className="kpi-value mono"
+                    style={{
+                      color: stats.latestReturn >= 0 ? T.positive : T.negative,
+                    }}
+                  >
+                    <AnimV
+                      value={stats.latestReturn}
+                      fmt={(v) => `${v.toFixed(2)}%`}
+                    />
+                  </div>
+                  <div className="kpi-sub">
+                    淨增值{" "}
+                    <AnimV
+                      value={stats.latestNetGain}
+                      fmt={(v) => (privacy ? "＊＊＊" : fmtS(v))}
+                    />
+                  </div>
+                </>
+              )}
             </div>
             <div className="kpi-item">
               <div className="kpi-label">現金資產</div>
@@ -2753,7 +3535,21 @@ export default function App() {
                   fmt={(v) => (privacy ? "＊＊＊＊" : fmtS(v))}
                 />
               </div>
-              <div className="kpi-sub">占比 {stats.cashRatio.toFixed(1)}%</div>
+              <div
+                className="kpi-sub"
+                title="口徑＝月度紀錄的現金資產；「從資產配置帶入」時現金＝現金＋緊急備用金"
+              >
+                占比 {stats.cashRatio.toFixed(1)}%
+              </div>
+              {/* 占比在資產成長後會失真，「可撐幾個月」才是備用金最直覺的安全指標；月支出含稅費加成 */}
+              <div className="kpi-sub">
+                {fireExpense > 0
+                  ? `約可支撐 ${(
+                      stats.cashAssets /
+                      ((fireExpense * (fireTaxFactor || 1)) / 12)
+                    ).toFixed(1)} 個月支出`
+                  : "設定年支出後顯示可支撐月數"}
+              </div>
               <div className="cash-bar-track">
                 <div
                   className="cash-bar-fill"
@@ -2767,11 +3563,9 @@ export default function App() {
                 className="cash-bar-label"
                 style={{ color: cashRC(stats.cashRatio) }}
               >
-                {stats.cashRatio < 3
-                  ? "⚠ 偏低"
-                  : stats.cashRatio < 5
-                  ? "注意"
-                  : stats.cashRatio > 25
+                {stats.cashRatio < 5
+                  ? "偏低"
+                  : stats.cashRatio > 30
                   ? "偏高"
                   : "健康"}
               </div>
@@ -2789,7 +3583,15 @@ export default function App() {
               </div>
             </div>
             <div className="kpi-item">
-              <div className="kpi-label">距 ATH</div>
+              <div
+                className="kpi-label"
+                title="ATH＝歷史最高總資產（All-Time High）"
+              >
+                距 ATH
+                <span className="help-tip" style={{ marginLeft: 4 }}>
+                  <HelpCircle size={10} />
+                </span>
+              </div>
               <div
                 className="kpi-value mono"
                 style={{
@@ -2889,14 +3691,30 @@ export default function App() {
                         )}`
                       )}
                     />
-                    <ARow l="TWR">
+                    <ARow
+                      l="TWR"
+                      tip="時間加權報酬：排除出入金時點的影響，衡量投資本身的表現"
+                    >
                       <AnimV
                         value={yr.twr}
                         fmt={(v) => fmtPP(v)}
                         className="a-row-v mono"
                       />
                     </ARow>
-                    <ARow l="MWR">
+                    <ARow
+                      l={
+                        yr.mwrIsYtd
+                          ? "MWR (YTD)"
+                          : yr.mwrIsPartial
+                          ? "MWR (期間)"
+                          : "MWR"
+                      }
+                      tip={
+                        yr.mwrIsPartial
+                          ? "金額加權報酬：計入出入金時點的效果，衡量你實際資金的成果，因此與 TWR 可能不同。此年度紀錄未滿 12 個月，已換算為該期間的實際報酬（非年化），與 TWR 同口徑"
+                          : "金額加權報酬（年化）：計入出入金時點的效果，衡量你實際資金的成果，因此與 TWR 可能不同"
+                      }
+                    >
                       <AnimV
                         value={yr.mwr === null ? 0 : yr.mwr}
                         fmt={(v) => (yr.mwr === null ? "N/A" : fmtPP(v))}
@@ -2995,14 +3813,21 @@ export default function App() {
                   className="dist-count"
                   title={
                     pd.length !== basisPd.length
-                      ? `已排除 ${pd.length - basisPd.length} 個未更新月份`
+                      ? `已排除 ${
+                          pd.length - basisPd.length
+                        } 個未更新或首筆月份；未更新期間的損益與出入金已併入恢復更新月份的有效報酬計算`
                       : undefined
                   }
                 >
                   {basisPd.length} 月
                 </span>
               </div>
-              <div style={{ height: 160 }}>
+              {/* recharts SVG 對螢幕閱讀器是一片空白，容器補一句話摘要當替代內容 */}
+              <div
+                style={{ height: 160 }}
+                role="img"
+                aria-label={`月報酬分佈圖，共 ${basisPd.length} 個月，勝率 ${winRate.toFixed(1)}%`}
+              >
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={retDist} barSize={40}>
                     <CartesianGrid
@@ -3016,12 +3841,12 @@ export default function App() {
                       dataKey="label"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                     />
                     <YAxis
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 10 }}
+                      tick={{ fill: T.textSecondary, fontSize: 10 }}
                       allowDecimals={false}
                     />
                     <Tooltip
@@ -3034,7 +3859,11 @@ export default function App() {
                         fontSize: 12,
                       }}
                     />
-                    <Bar dataKey="count" radius={[4, 4, 0, 0]}>
+                    <Bar
+                      dataKey="count"
+                      radius={[4, 4, 0, 0]}
+                      isAnimationActive={false}
+                    >
                       {retDist.map((it, i) => (
                         <Cell key={i} fill={it.color} fillOpacity={0.8} />
                       ))}
@@ -3061,7 +3890,7 @@ export default function App() {
                     { key: "assets", label: "總資產" },
                     { key: "invested", label: "投資" },
                     { key: "composite", label: "複合" },
-                    { key: "twr", label: "累積報酬" },
+                    { key: "twr", label: "累積報酬 TWR" },
                   ].map((it) => (
                     <button
                       key={it.key}
@@ -3076,6 +3905,7 @@ export default function App() {
                 </div>
                 <select
                   className="select-sm"
+                  aria-label="趨勢區間"
                   value={trendRange}
                   onChange={(e) => setTrendRange(e.target.value)}
                 >
@@ -3088,6 +3918,20 @@ export default function App() {
             <div
               className="chart-wrap"
               onMouseLeave={() => setHoveredMonth(null)}
+              role="img"
+              aria-label={`趨勢分析圖（${
+                {
+                  return: "月報酬率",
+                  assets: "總資產",
+                  invested: "投資",
+                  composite: "複合",
+                  twr: "累積報酬 TWR",
+                }[chartType] || "趨勢"
+              }）${
+                latest && !privacy
+                  ? `，最新總資產 NT$${fmtS(latest.totalAssets)}`
+                  : ""
+              }`}
             >
               <ResponsiveContainer width="100%" height={340}>
                 {chartType === "return" ? (
@@ -3106,12 +3950,12 @@ export default function App() {
                       interval="preserveStartEnd"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                     />
                     <YAxis
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                       unit="%"
                     />
                     <Tooltip
@@ -3125,7 +3969,11 @@ export default function App() {
                       cursor={<ChartCursor height={340} />}
                     />
                     <ReferenceLine y={0} stroke={T.border} />
-                    <Bar dataKey="returnRate" radius={[3, 3, 0, 0]}>
+                    <Bar
+                      dataKey="returnRate"
+                      radius={[3, 3, 0, 0]}
+                      isAnimationActive={false}
+                    >
                       {trendData.map((it, i) => (
                         <Cell
                           key={i}
@@ -3161,13 +4009,13 @@ export default function App() {
                       interval="preserveStartEnd"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                     />
                     <YAxis
                       yAxisId="l"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                       tickFormatter={(v) =>
                         privacy ? "•" : `${(v / 1e4).toFixed(0)}萬`
                       }
@@ -3177,7 +4025,7 @@ export default function App() {
                       orientation="right"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                       unit="%"
                     />
                     <Tooltip
@@ -3198,6 +4046,7 @@ export default function App() {
                       fill="url(#cA)"
                       strokeWidth={2}
                       dot={false}
+                      isAnimationActive={false}
                     />
                     <Bar
                       yAxisId="r"
@@ -3205,6 +4054,7 @@ export default function App() {
                       radius={[2, 2, 0, 0]}
                       barSize={16}
                       fillOpacity={0.6}
+                      isAnimationActive={false}
                     >
                       {trendData.map((it, i) => (
                         <Cell
@@ -3213,6 +4063,19 @@ export default function App() {
                         />
                       ))}
                     </Bar>
+                    {/* 備註月份標記：讓「2025-04 為什麼跌」這類故事直接浮在圖上，hover 資訊列會顯示內容 */}
+                    {notedTrend.map((r) => (
+                      <ReferenceDot
+                        key={`note-${r.month}`}
+                        yAxisId="l"
+                        x={r.month}
+                        y={r.totalAssets}
+                        r={4}
+                        fill={T.gold}
+                        stroke={T.surface}
+                        strokeWidth={1.5}
+                      />
+                    ))}
                   </ComposedChart>
                 ) : chartType === "twr" ? (
                   <AreaChart data={trendData}>
@@ -3244,12 +4107,12 @@ export default function App() {
                       interval="preserveStartEnd"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                     />
                     <YAxis
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                       unit="%"
                     />
                     <Tooltip
@@ -3270,6 +4133,7 @@ export default function App() {
                       fill="url(#tG)"
                       strokeWidth={2.5}
                       dot={false}
+                      isAnimationActive={false}
                     />
                   </AreaChart>
                 ) : (
@@ -3302,12 +4166,12 @@ export default function App() {
                       interval="preserveStartEnd"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                     />
                     <YAxis
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 11 }}
+                      tick={{ fill: T.textSecondary, fontSize: 11 }}
                       tickFormatter={(v) =>
                         privacy ? "•" : `${(v / 1e4).toFixed(0)}萬`
                       }
@@ -3337,6 +4201,7 @@ export default function App() {
                         fill: chartType === "invested" ? T.cyan : T.gold,
                       }}
                       activeDot={{ r: 5, stroke: T.surface, strokeWidth: 2 }}
+                      isAnimationActive={false}
                     />
                     {chartType === "assets" && hasLiab && (
                       <Area
@@ -3347,8 +4212,22 @@ export default function App() {
                         strokeWidth={2}
                         strokeDasharray="5 3"
                         dot={false}
+                        isAnimationActive={false}
                       />
                     )}
+                    {/* 備註月份標記：讓「2025-04 為什麼跌」這類故事直接浮在圖上，hover 資訊列會顯示內容 */}
+                    {chartType === "assets" &&
+                      notedTrend.map((r) => (
+                        <ReferenceDot
+                          key={`note-${r.month}`}
+                          x={r.month}
+                          y={r.totalAssets}
+                          r={4}
+                          fill={T.gold}
+                          stroke={T.surface}
+                          strokeWidth={1.5}
+                        />
+                      ))}
                   </AreaChart>
                 )}
               </ResponsiveContainer>
@@ -3389,6 +4268,11 @@ export default function App() {
                   現金{" "}
                   <b className="mono">{mask(fmtS(hoveredData.cashAssets))}</b>
                 </span>
+                {hoveredData.note && hoveredData.note !== "歷史資料導入" && (
+                  <span className="hover-kpi-item">
+                    📝 {hoveredData.note}
+                  </span>
+                )}
               </div>
             )}
           </section>
@@ -3400,7 +4284,7 @@ export default function App() {
                   成長貢獻分解
                 </h3>
                 <p className="card-desc">
-                  總資產＝起始資產＋累計投入＋累計報酬，看清成長來自存錢還是市場
+                  總資產＝起始資產＋累計投入＋累計淨增值，看清成長來自存錢還是市場
                 </p>
               </div>
               {contribData && (
@@ -3415,7 +4299,7 @@ export default function App() {
                       (contribData.totalInflow / contribData.growth) *
                       100
                     ).toFixed(0)}%)`}
-                  ｜報酬{" "}
+                  ｜淨增值{" "}
                   <b
                     style={{
                       color:
@@ -3435,7 +4319,17 @@ export default function App() {
             </div>
             {contribData ? (
               <>
-                <div className="chart-wrap">
+                <div
+                  className="chart-wrap"
+                  role="img"
+                  aria-label={`成長貢獻分解圖${
+                    privacy
+                      ? ""
+                      : `，累計投入 NT$${fmtS(
+                          contribData.totalInflow
+                        )}、累計淨增值 NT$${fmtS(contribData.totalGain)}`
+                  }`}
+                >
                   <ResponsiveContainer width="100%" height={300}>
                     <ComposedChart data={contribData.rows}>
                       <defs>
@@ -3466,12 +4360,12 @@ export default function App() {
                         interval="preserveStartEnd"
                         axisLine={false}
                         tickLine={false}
-                        tick={{ fill: T.textTertiary, fontSize: 11 }}
+                        tick={{ fill: T.textSecondary, fontSize: 11 }}
                       />
                       <YAxis
                         axisLine={false}
                         tickLine={false}
-                        tick={{ fill: T.textTertiary, fontSize: 11 }}
+                        tick={{ fill: T.textSecondary, fontSize: 11 }}
                         tickFormatter={(v) =>
                           privacy ? "•" : `${(v / 1e4).toFixed(0)}萬`
                         }
@@ -3491,6 +4385,7 @@ export default function App() {
                             ? "rgba(255,255,255,0.08)"
                             : "rgba(28,28,30,0.08)"
                         }
+                        isAnimationActive={false}
                       />
                       <Area
                         type="monotone"
@@ -3500,6 +4395,7 @@ export default function App() {
                         stroke={T.cyan}
                         strokeWidth={1.5}
                         fill="url(#ciG)"
+                        isAnimationActive={false}
                       />
                       <Line
                         type="monotone"
@@ -3508,6 +4404,7 @@ export default function App() {
                         stroke={T.gold}
                         strokeWidth={2.5}
                         dot={false}
+                        isAnimationActive={false}
                       />
                     </ComposedChart>
                   </ResponsiveContainer>
@@ -3529,7 +4426,7 @@ export default function App() {
                   </span>
                   <span>
                     <i style={{ background: T.gold }} />
-                    總資產（與堆疊頂的落差＝累計報酬）
+                    總資產（與堆疊頂的落差＝累計淨增值）
                   </span>
                 </div>
               </>
@@ -3591,7 +4488,13 @@ export default function App() {
                 </div>
                 <span className="dist-count">{pd.length} 月</span>
               </div>
-              <div style={{ height: 180 }}>
+              <div
+                style={{ height: 180 }}
+                role="img"
+                aria-label={`回撤走勢圖，共 ${pd.length} 個月，最大回撤 ${fmtPP(
+                  stats.maxDrawdown
+                )}`}
+              >
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={pd}>
                     <defs>
@@ -3622,12 +4525,12 @@ export default function App() {
                       interval="preserveStartEnd"
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 10 }}
+                      tick={{ fill: T.textSecondary, fontSize: 10 }}
                     />
                     <YAxis
                       axisLine={false}
                       tickLine={false}
-                      tick={{ fill: T.textTertiary, fontSize: 10 }}
+                      tick={{ fill: T.textSecondary, fontSize: 10 }}
                       unit="%"
                     />
                     <Tooltip
@@ -3642,6 +4545,7 @@ export default function App() {
                       fill="url(#ddG)"
                       strokeWidth={2}
                       dot={false}
+                      isAnimationActive={false}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -3711,7 +4615,10 @@ export default function App() {
                                       : T.negative,
                                     alpha
                                   ),
-                                  color: alpha > 0.45 ? "#fff" : T.text,
+                                  /* alpha 閾值只對深底成立：淺色主題半透明主題色疊白底後仍偏亮，
+                                     白字對比最高僅約 3.7:1，一律用深色文字才過 AA */
+                                  color:
+                                    isDark && alpha > 0.45 ? "#fff" : T.text,
                                 }
                           }
                           title={`${r.month}　${fmtP(r.returnRate)}${
@@ -3763,6 +4670,9 @@ export default function App() {
                 <span className="hover-kpi-item">
                   現金 <b className="mono">{mask(fmtS(hmSelData.cashAssets))}</b>
                 </span>
+                {hmSelData.note && hmSelData.note !== "歷史資料導入" && (
+                  <span className="hover-kpi-item">📝 {hmSelData.note}</span>
+                )}
                 {Number(hmSelData.prevAssets) !== 0 &&
                   Number(hmSelData.totalAssets) ===
                     Number(hmSelData.prevAssets) && (
@@ -3807,6 +4717,7 @@ export default function App() {
                 </div>
                 <select
                   className="select-sm"
+                  aria-label="年份篩選"
                   value={filterYear}
                   onChange={(e) => setFilterYear(e.target.value)}
                 >
@@ -3819,6 +4730,9 @@ export default function App() {
                 </select>
               </div>
             </div>
+            {/* 桌面表格／手機卡片二選一渲染：原本兩份完整清單常駐 DOM、
+                僅靠 CSS 隱藏其一，搜尋每個字元都付雙倍 render 成本 */}
+            {!isMobile && (
             <div className="table-scroll">
               <table className="data-table">
                 <thead>
@@ -3842,8 +4756,8 @@ export default function App() {
                     </ThS>
                     <th className="th-r">現金</th>
                     <th className="th-r">投資</th>
-                    <th className="th-r">淨投入</th>
-                    <th className="th-r">淨提領</th>
+                    <th className="th-r">投入金額</th>
+                    <th className="th-r">提領金額</th>
                     {hasLiab && <th className="th-r">負債</th>}
                     <ThS
                       col="returnRate"
@@ -3968,7 +4882,9 @@ export default function App() {
                 </tbody>
               </table>
             </div>
-            {/* 手機版卡片視圖：≤768px 隱藏表格、改用卡片，與資產配置分頁行為一致 */}
+            )}
+            {/* 手機版卡片視圖：≤768px 改用卡片，與資產配置分頁行為一致 */}
+            {isMobile && (
             <div className="rec-mobile-list">
               {tableData.map((row) => (
                 <div className="rec-mobile-card" key={`m-${row.month}`}>
@@ -4002,7 +4918,7 @@ export default function App() {
                       </span>
                     </div>
                     <div className="rec-mobile-field">
-                      <span className="rec-mobile-label">淨投入</span>
+                      <span className="rec-mobile-label">投入金額</span>
                       <span
                         className="rec-mobile-value mono"
                         style={{
@@ -4013,7 +4929,7 @@ export default function App() {
                       </span>
                     </div>
                     <div className="rec-mobile-field">
-                      <span className="rec-mobile-label">淨提領</span>
+                      <span className="rec-mobile-label">提領金額</span>
                       <span
                         className="rec-mobile-value mono"
                         style={{
@@ -4061,6 +4977,7 @@ export default function App() {
                 <div className="empty-cell">查無資料</div>
               )}
             </div>
+            )}
           </section>
         </div>
       )}
@@ -4082,6 +4999,7 @@ export default function App() {
               </div>
               <select
                 className="select-sm"
+                aria-label="模擬期間"
                 value={scenarioMonths}
                 onChange={(e) => setScenarioMonths(Number(e.target.value))}
               >
@@ -4099,7 +5017,7 @@ export default function App() {
               <span>
                 統計基礎：近 {scenarioDefaults.sampleMonths} 個月
                 {scenarioDefaults.excludedMonths > 0
-                  ? `（已排除 ${scenarioDefaults.excludedMonths} 個未更新月份）`
+                  ? `（已排除 ${scenarioDefaults.excludedMonths} 個未更新或首筆月份，未更新期間損益已併入恢復月的有效報酬）`
                   : ""}
                 ｜月報酬 μ {scenarioDefaults.avgReturn.toFixed(1)}%（年化{" "}
                 {annualizePct(scenarioDefaults.avgReturn).toFixed(1)}%）・σ{" "}
@@ -4111,7 +5029,7 @@ export default function App() {
                 ・年增{" "}
                 {scenarioDefaults.inflowGrowthEstimated
                   ? `${scenarioDefaults.inflowGrowth.toFixed(1)}%`
-                  : "0%（資料未滿 24 個月）"}
+                  : `0%（${scenarioDefaults.inflowGrowthSkipReason}）`}
                 ｜樂觀＝P90、保守＝P10（非固定報酬率外推）
               </span>
             </div>
@@ -4269,7 +5187,7 @@ export default function App() {
                           (
                           {scenarioDefaults.inflowGrowthEstimated
                             ? `${scenarioDefaults.inflowGrowth.toFixed(1)}%`
-                            : "0%・資料未滿 24 個月"}
+                            : `0%・${scenarioDefaults.inflowGrowthSkipReason}`}
                           )
                         </span>
                       </>
@@ -4335,7 +5253,15 @@ export default function App() {
                     setScenarioEvents((p) =>
                       p.length >= 5
                         ? p
-                        : [...p, { id: generateId(), month: "12", amount: "" }]
+                        : [
+                            ...p,
+                            {
+                              id: generateId(),
+                              month: "12",
+                              amount: "",
+                              label: "",
+                            },
+                          ]
                     )
                   }
                 >
@@ -4392,18 +5318,36 @@ export default function App() {
                           : ""}
                         ，金額
                       </span>
-                      <input
+                      {/* 事件金額與目標/FIRE 欄同等敏感，沿用同款「點擊解鎖、失焦復原」遮罩 */}
+                      <MaskedNumInput
+                        privacy={privacy}
                         className="field-input mono"
-                        type="number"
-                        placeholder="+入金 / -支出"
                         style={{ width: 150, padding: "6px 10px" }}
+                        placeholder="+入金 / -支出"
+                        ariaLabel="事件金額，正為入金、負為支出"
                         value={ev.amount}
-                        aria-label="事件金額，正為入金、負為支出"
+                        onChange={(v) =>
+                          setScenarioEvents((p) =>
+                            p.map((x) =>
+                              x.id === ev.id ? { ...x, amount: v } : x
+                            )
+                          )
+                        }
+                      />
+                      {/* 事件已跨 session 保存，命名才能在幾個月後認得出「這筆是頭期款」 */}
+                      <input
+                        className="field-input"
+                        type="text"
+                        maxLength={20}
+                        style={{ width: 170, padding: "6px 10px" }}
+                        placeholder="事件名稱（選填），如：頭期款"
+                        aria-label="事件名稱（選填）"
+                        value={ev.label || ""}
                         onChange={(e) =>
                           setScenarioEvents((p) =>
                             p.map((x) =>
                               x.id === ev.id
-                                ? { ...x, amount: e.target.value }
+                                ? { ...x, label: e.target.value }
                                 : x
                             )
                           )
@@ -4435,6 +5379,18 @@ export default function App() {
                       >
                         <Trash2 size={13} />
                       </button>
+                      {/* 主圖只跑 scenarioMonths 個月、FIRE 卻推 600 個月：超期事件對兩張圖一吃一不吃，不提示會像事件無效 */}
+                      {Number(ev.month) > scenarioMonths && (
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: T.amber,
+                            flexBasis: "100%",
+                          }}
+                        >
+                          超出目前模擬期間，僅影響 FIRE 推算
+                        </span>
+                      )}
                     </div>
                   ))}
                   <div style={{ fontSize: 11, color: T.textTertiary }}>
@@ -4524,7 +5480,74 @@ export default function App() {
                 </span>
               </div>
             )}
-            <div className="chart-wrap si si-3">
+            <div
+              className="si si-2"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+                marginBottom: 10,
+              }}
+            >
+              {/* 名目值看 20 年購買力已縮水三成，實質模式把整張圖折回今日物價 */}
+              <div className="seg-group">
+                {[
+                  { v: false, label: "名目" },
+                  { v: true, label: "實質" },
+                ].map((o) => (
+                  <button
+                    key={o.label}
+                    className={`seg-btn ${
+                      scenarioReal === o.v ? "active" : ""
+                    }`}
+                    onClick={() => setScenarioReal(o.v)}
+                    title={
+                      o.v
+                        ? "以今日購買力顯示（按通膨折算）"
+                        : "以名目金額顯示（未扣通膨）"
+                    }
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 12,
+                  color: T.textSecondary,
+                }}
+              >
+                通膨假設
+                <input
+                  className="field-input mono"
+                  type="number"
+                  min={0}
+                  max={5}
+                  step={0.1}
+                  style={{ width: 64, padding: "6px 10px" }}
+                  aria-label="通膨年增率假設（%），0 到 5"
+                  value={inflationPct}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    setInflationPct(
+                      Number.isFinite(n) ? Math.min(5, Math.max(0, n)) : 2
+                    );
+                  }}
+                />
+                %／年（FIRE 門檻共用）
+              </label>
+            </div>
+            <div
+              className="chart-wrap si si-3"
+              role="img"
+              aria-label={`情境模擬圖，${scenarioMonths / 12} 年蒙地卡羅路徑的樂觀、基準與悲觀走勢${
+                scenarioReal ? "，以實質購買力顯示" : ""
+              }`}
+            >
               <ResponsiveContainer width="100%" height={360}>
                 <AreaChart data={scData}>
                   <defs>
@@ -4570,12 +5593,12 @@ export default function App() {
                     interval="preserveStartEnd"
                     axisLine={false}
                     tickLine={false}
-                    tick={{ fill: T.textTertiary, fontSize: 11 }}
+                    tick={{ fill: T.textSecondary, fontSize: 11 }}
                   />
                   <YAxis
                     axisLine={false}
                     tickLine={false}
-                    tick={{ fill: T.textTertiary, fontSize: 11 }}
+                    tick={{ fill: T.textSecondary, fontSize: 11 }}
                     tickFormatter={(v) =>
                       privacy ? "•" : `${(v / 1e4).toFixed(0)}萬`
                     }
@@ -4592,6 +5615,7 @@ export default function App() {
                     fill="url(#bG)"
                     strokeWidth={2}
                     dot={false}
+                    isAnimationActive={false}
                   />
                   <Area
                     type="monotone"
@@ -4602,6 +5626,7 @@ export default function App() {
                     strokeWidth={2.5}
                     dot={false}
                     strokeDasharray="6 3"
+                    isAnimationActive={false}
                   />
                   <Area
                     type="monotone"
@@ -4611,18 +5636,23 @@ export default function App() {
                     fill="url(#brG)"
                     strokeWidth={2}
                     dot={false}
+                    isAnimationActive={false}
                   />
-                  <ReferenceLine
-                    y={stats.totalAssets}
-                    stroke={T.textTertiary}
-                    strokeDasharray="3 3"
-                    label={{
-                      value: "現在",
-                      fill: T.textTertiary,
-                      fontSize: 11,
-                    }}
-                  />
-                  {goalValue > 0 && (
+                  {/* 實質模式下「現在」「目標」是固定名目金額，實質價值隨時間遞減，
+                      水平 ReferenceLine 畫不出來，改用 scData 內折算好的曲線（fill none 當線用） */}
+                  {!scenarioReal && (
+                    <ReferenceLine
+                      y={stats.totalAssets}
+                      stroke={T.textTertiary}
+                      strokeDasharray="3 3"
+                      label={{
+                        value: "現在",
+                        fill: T.textTertiary,
+                        fontSize: 11,
+                      }}
+                    />
+                  )}
+                  {goalValue > 0 && !scenarioReal && (
                     <ReferenceLine
                       y={goalValue}
                       stroke={T.gold}
@@ -4634,8 +5664,32 @@ export default function App() {
                       }}
                     />
                   )}
+                  {scenarioReal && (
+                    <Area
+                      type="monotone"
+                      dataKey="nowReal"
+                      name="現在（實質）"
+                      stroke={T.textTertiary}
+                      fill="none"
+                      strokeWidth={1.5}
+                      strokeDasharray="3 3"
+                      dot={false}
+                    />
+                  )}
+                  {scenarioReal && goalValue > 0 && (
+                    <Area
+                      type="monotone"
+                      dataKey="goalReal"
+                      name="目標（實質）"
+                      stroke={T.gold}
+                      fill="none"
+                      strokeWidth={1.5}
+                      strokeDasharray="6 3"
+                      dot={false}
+                    />
+                  )}
                   {latest &&
-                    activeEvents
+                    activeEventMarkers
                       .filter((ev) => ev.month <= scenarioMonths)
                       .map((ev, i) => (
                         <ReferenceLine
@@ -4644,11 +5698,12 @@ export default function App() {
                           stroke={ev.amount >= 0 ? T.positive : T.negative}
                           strokeDasharray="4 3"
                           label={{
-                            value: mask(
+                            // 名稱不遮罩（非金額）、金額照常吃隱私模式
+                            value: `${ev.label ? `${ev.label} ` : ""}${mask(
                               `${ev.amount >= 0 ? "+" : "-"}${fmtS(
                                 Math.abs(ev.amount)
                               )}`
-                            ),
+                            )}`,
                             fill: ev.amount >= 0 ? T.positive : T.negative,
                             fontSize: 10,
                           }}
@@ -4656,6 +5711,18 @@ export default function App() {
                       ))}
                 </AreaChart>
               </ResponsiveContainer>
+            </div>
+            <div
+              style={{
+                fontSize: 11,
+                color: T.textTertiary,
+                marginTop: 6,
+              }}
+            >
+              口徑：
+              {scenarioReal
+                ? `實質購買力——已按通膨 ${inflationPct}%／年折算回今日物價，「現在」「目標」為固定名目金額的實質價值`
+                : "名目金額（未扣通膨）"}
             </div>
             <div className="scenario-note">
               <AlertTriangle size={14} />
@@ -4674,11 +5741,12 @@ export default function App() {
                   財務自由（FIRE）
                 </h3>
                 <p className="card-desc">
-                  自由數字＝（年支出 − 退休後年收）×{" "}
+                  自由數字＝（年支出 − 退休後年收）× 支出加成係數 ×{" "}
                   {Number.isInteger(100 / fireSwr)
                     ? 100 / fireSwr
                     : (100 / fireSwr).toFixed(1)}
-                  ；達標門檻隨每年 2% 通膨成長。沿用上方模擬假設（μ／σ／投入）推算至
+                  ；達標門檻隨每年 {inflationPct}%
+                  通膨成長（與上方通膨假設共用）。沿用上方模擬假設（μ／σ／投入）推算至
                   50 年，有負債時以淨值計算。
                 </p>
               </div>
@@ -4725,10 +5793,11 @@ export default function App() {
                 />
               </div>
               <div className="seg-group">
+                {/* 快速鍵是「年支出」而非目標資產，檔位須落在一般家庭年支出級距，否則 4% 法則反推的自由數字會嚴重失真 */}
                 {[
-                  { v: 6000000, label: "低 600萬" },
-                  { v: 10000000, label: "中 1000萬" },
-                  { v: 15000000, label: "高 1500萬" },
+                  { v: 400000, label: "簡約 40萬" },
+                  { v: 600000, label: "舒適 60萬" },
+                  { v: 1000000, label: "寬裕 100萬" },
                 ].map((o) => (
                   <button
                     key={o.v}
@@ -4747,6 +5816,44 @@ export default function App() {
                   </button>
                 ))}
               </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginTop: 10,
+              }}
+            >
+              <div
+                className="goal-input-wrap"
+                style={{ flex: "0 1 auto", minWidth: 240 }}
+              >
+                <span className="goal-prefix mono">
+                  支出加成係數（稅/健保）
+                </span>
+                <input
+                  className="field-input mono"
+                  type="number"
+                  min={1}
+                  max={2}
+                  step={0.01}
+                  style={{ width: 90 }}
+                  placeholder="1.00"
+                  aria-label="支出加成係數（稅與二代健保），1 到 2"
+                  value={fireTaxInput}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setFireTaxInput(v);
+                    const n = Number(v);
+                    setFireTaxFactor(n > 1 && n <= 2 ? n : 1);
+                  }}
+                />
+              </div>
+              <span style={{ fontSize: 11, color: T.textTertiary }}>
+                退休提領需含稅與二代健保，建議 1.05~1.15
+              </span>
             </div>
             {fireStats && fireMuWarn && (
               <div
@@ -5029,6 +6136,8 @@ export default function App() {
             isDark={isDark}
             privacy={privacy}
             active={activeTab === "allocation"}
+            fireExpense={fireExpense}
+            fireTaxFactor={fireTaxFactor}
           />
         </ErrorBoundary>
       </div>
@@ -5088,7 +6197,16 @@ class ErrorBoundary extends React.Component {
 }
 /* 隱私模式下可遮罩的數字輸入：有值時顯示＊＊＊＊＊，點擊暫時解鎖編輯、失焦恢復遮罩。
    目標金額與 FIRE 年支出跟總資產一樣敏感，不能在隱私模式下裸奔 */
-function MaskedNumInput({ privacy, value, placeholder, ariaLabel, onChange }) {
+function MaskedNumInput({
+  privacy,
+  value,
+  placeholder,
+  ariaLabel,
+  onChange,
+  // 情境事件金額等處版型與目標欄不同，允許覆寫外觀但沿用同一套遮罩行為
+  className = "goal-input mono",
+  style,
+}) {
   const [reveal, setReveal] = useState(false);
   useEffect(() => {
     if (!privacy) setReveal(false);
@@ -5097,7 +6215,8 @@ function MaskedNumInput({ privacy, value, placeholder, ariaLabel, onChange }) {
     return (
       <button
         type="button"
-        className="goal-input mono goal-masked"
+        className={`${className} goal-masked`}
+        style={style}
         onClick={() => setReveal(true)}
         title="隱私模式中，點擊以編輯"
         aria-label={`${ariaLabel}（已遮罩，點擊編輯）`}
@@ -5108,7 +6227,8 @@ function MaskedNumInput({ privacy, value, placeholder, ariaLabel, onChange }) {
   }
   return (
     <input
-      className="goal-input mono"
+      className={className}
+      style={style}
       type="number"
       placeholder={placeholder}
       aria-label={ariaLabel}
@@ -5119,15 +6239,57 @@ function MaskedNumInput({ privacy, value, placeholder, ariaLabel, onChange }) {
     />
   );
 }
-function FF({ label, type, value, onChange, big }) {
+function FF({ label, type, value, onChange, big, privacy, tip }) {
+  // tip：欄位口徑說明（重用 ARow 的 help-tip 模式）。第一筆記帳是理解錯誤的高風險點，
+  // 「淨投入≠買股金額」這類口徑填錯會讓每月報酬率都算錯
+  const labelNode = (
+    <>
+      {label}
+      {tip && (
+        <span className="help-tip" title={tip}>
+          <HelpCircle size={11} />
+        </span>
+      )}
+    </>
+  );
+  // 金額欄比照 MaskedNumInput：隱私模式下遮罩、點擊暫時揭示、失焦復原，
+  // 否則編輯紀錄時總資產／現金／負債會在隱私模式下明碼裸奔
+  const [reveal, setReveal] = useState(false);
+  // label 與 input 需 htmlFor/id 配對，螢幕閱讀器才唸得出欄位名稱
+  const fieldId = useId();
+  useEffect(() => {
+    if (!privacy) setReveal(false);
+  }, [privacy]);
+  if (privacy && !reveal && value !== "" && value != null) {
+    return (
+      <div className="form-field">
+        <label className="field-label" htmlFor={fieldId}>{labelNode}</label>
+        <button
+          type="button"
+          id={fieldId}
+          className={`field-input mono field-masked ${big ? "field-big" : ""}`}
+          onClick={() => setReveal(true)}
+          title="隱私模式中，點擊以編輯"
+          aria-label={`${label}（已遮罩，點擊編輯）`}
+        >
+          ＊＊＊＊＊
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="form-field">
-      <label className="field-label">{label}</label>
+      <label className="field-label" htmlFor={fieldId}>{labelNode}</label>
       <input
+        id={fieldId}
         className={`field-input mono ${big ? "field-big" : ""}`}
         type={type}
         value={value}
+        autoFocus={privacy && reveal}
         onChange={(e) => onChange(e.target.value)}
+        onBlur={() => {
+          if (privacy) setReveal(false);
+        }}
       />
     </div>
   );
@@ -5176,6 +6338,15 @@ function ThS({ col, cur, dir, onClick, children, right }) {
     <th
       className={right ? "th-r th-sort" : "th-l th-sort"}
       onClick={() => onClick(col)}
+      // th 天生不可聚焦，補鍵盤支援否則排序功能對鍵盤使用者完全不可用
+      tabIndex={0}
+      role="button"
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick(col);
+        }
+      }}
       aria-sort={a ? (dir === "asc" ? "ascending" : "descending") : "none"}
       style={{ cursor: "pointer", userSelect: "none" }}
     >
@@ -5237,8 +6408,21 @@ function Spark({ rows }) {
 function CTip({ active, payload, label, mode, onHover, privacy }) {
   const hasData = !!(active && payload && payload.length);
   // setState 必須放 useEffect：在 render 期間呼叫父層 setState 會觸發 React 警告
+  // rAF 節流＋同值跳過：onHover 是 App 頂層 setState，滑鼠橫掃圖表時
+  // 每個資料點都 set 一次會讓整個分析分頁連續重繪，低階裝置會掉幀；
+  // 合併到每幀最多一次、且值沒變就不呼叫
+  const lastHoverRef = useRef(undefined);
+  const hoverRafRef = useRef(0);
   useEffect(() => {
-    if (onHover) onHover(hasData ? label : null);
+    if (!onHover) return undefined;
+    const next = hasData ? label : null;
+    if (lastHoverRef.current === next) return undefined;
+    cancelAnimationFrame(hoverRafRef.current);
+    hoverRafRef.current = requestAnimationFrame(() => {
+      lastHoverRef.current = next;
+      onHover(next);
+    });
+    return () => cancelAnimationFrame(hoverRafRef.current);
   }, [hasData, label, onHover]);
   if (!hasData) return null;
   const mm = (s) => (privacy ? "＊＊＊＊＊" : s);
@@ -5305,7 +6489,11 @@ function ContribTip({ active, payload, label, privacy }) {
   const rows = [
     { l: "起始資產", v: d.base, c: T.textTertiary },
     { l: "累計投入", v: d.cumInflow, c: T.cyan },
-    { l: "累計報酬", v: d.cumGain, c: d.cumGain >= 0 ? T.positive : T.negative },
+    {
+      l: "累計淨增值",
+      v: d.cumGain,
+      c: d.cumGain >= 0 ? T.positive : T.negative,
+    },
     { l: "總資產", v: d.total, c: T.gold },
   ];
   return (
@@ -5329,7 +6517,11 @@ function ConfirmModal({
   confirmLabel = "確認",
   secondaryLabel,
   onSecondary,
+  /* 預設 danger 保留紅色警示；非破壞性確認（匯入/覆蓋/移動等）傳 normal，
+     避免紅色視覺稀釋真正刪除/重置的警示強度 */
+  variant = "danger",
 }) {
+  const trapRef = useFocusTrap();
   useEffect(() => {
     const h = (e) => {
       if (e.key === "Escape") onCancel();
@@ -5339,6 +6531,7 @@ function ConfirmModal({
   }, [onCancel]);
   return (
     <div
+      ref={trapRef}
       className="modal-overlay"
       role="dialog"
       aria-modal="true"
@@ -5348,13 +6541,18 @@ function ConfirmModal({
       }}
     >
       <div className="modal">
-        <div className="modal-icon">
-          <AlertTriangle size={22} />
+        <div className={`modal-icon ${variant}`}>
+          {variant === "danger" ? (
+            <AlertTriangle size={22} />
+          ) : (
+            <HelpCircle size={22} />
+          )}
         </div>
         <div className="modal-title">{title}</div>
         <div className="modal-text">{message}</div>
         <div className="modal-actions">
-          <button className="modal-cancel" onClick={onCancel}>
+          {/* 焦點預設放在「取消」：表單支援 Enter 送出，慣性連按 Enter 不應直接觸發紅色破壞性動作 */}
+          <button className="modal-cancel" autoFocus onClick={onCancel}>
             取消
           </button>
           {secondaryLabel && onSecondary && (
@@ -5369,8 +6567,7 @@ function ConfirmModal({
             </button>
           )}
           <button
-            className="modal-confirm"
-            autoFocus
+            className={`modal-confirm ${variant}`}
             onClick={() => {
               onConfirm();
               onCancel();
@@ -5386,7 +6583,6 @@ function ConfirmModal({
 
 /* ═══════════ CSS — generated from theme ═══════════ */
 const makeCSS = (T) => `
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,300..800&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body,#root{min-height:100vh;background:${T.bg};color:${T.text}}
 body{transition:background 0.3s ease,color 0.3s ease;font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans TC',sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;font-optical-sizing:auto}
@@ -5424,6 +6620,8 @@ table{border-collapse:collapse}
 .header-title{font-size:clamp(24px,4vw,36px);font-weight:800;letter-spacing:-0.04em;line-height:1.1;color:${T.text}}
 .header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .cloud-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:8px 12px;background:${T.surface};border:1px solid ${T.border};border-radius:8px;transition:all 0.15s}
+/* 隱私模式鈕的極小 label：桌機有 hover title 不必顯示，觸控裝置沒有 title 才靠它辨識 */
+.privacy-label{display:none;font-size:10px;font-weight:700;letter-spacing:0.05em}
 
 .btn-ghost{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:1px solid ${T.border};background:${T.surface};border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:${T.text};transition:all 0.2s cubic-bezier(0.16,1,0.3,1)}
 .btn-ghost:hover{border-color:${T.borderStrong};box-shadow:${T.shadow1};transform:translateY(-1px)}
@@ -5519,6 +6717,8 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .field-label{font-size:11px;font-weight:700;color:${T.textSecondary};letter-spacing:0.02em}
 .field-input{width:100%;border:1.5px solid ${T.border};outline:none;background:${T.surfaceInset};border-radius:8px;padding:10px 14px;font-size:14px;font-weight:500;color:${T.text};transition:border-color 0.2s,box-shadow 0.2s}
 .field-input:focus{border-color:${T.gold};box-shadow:0 0 0 3px ${T.goldLight}}
+.field-masked{cursor:pointer;text-align:left;letter-spacing:0.1em;color:${T.textTertiary}}
+.field-masked:hover{color:${T.textSecondary}}
 .field-big{font-size:18px;font-weight:500}
 .form-preview{background:${T.surfaceAlt};border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:12px;border:1px solid ${T.border}}
 .preview-label{font-size:9px;font-weight:700;letter-spacing:0.18em;color:${T.textTertiary};text-transform:uppercase}
@@ -5534,7 +6734,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .badge{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600}
 .badge-blue{background:${T.goldLight};color:${T.gold}}
 .alert{padding:12px 16px;border-radius:10px;font-size:13px;font-weight:500;margin-bottom:12px}
-.alert-warn{background:rgba(138,106,46,0.07);color:${T.amber};border:1px solid rgba(138,106,46,0.18)}
+.alert-warn{background:${hexA(T.amber, 0.07)};color:${T.amber};border:1px solid ${hexA(T.amber, 0.18)}}
 .alert-error{background:${T.negativeLight};color:${T.negative}}
 
 .chart-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px;flex-wrap:wrap}
@@ -5615,6 +6815,8 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .range-input::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:${T.gold};cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.25),0 0 0 3px ${T.goldLight};transition:all 0.2s cubic-bezier(0.16,1,0.3,1)}
 .range-input::-webkit-slider-thumb:hover{transform:scale(1.12);box-shadow:0 2px 12px rgba(0,0,0,0.3),0 0 0 4px ${T.goldLight}}
 .range-input::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:${T.gold};cursor:pointer;border:none}
+/* 滑桿被全域 outline:none 關掉焦點框，鍵盤操作時看不到焦點在哪（WCAG 2.4.7），補金色外框光暈 */
+.range-input:focus-visible{outline:2px solid ${T.gold};outline-offset:3px;border-radius:999px}
 .btn-reset-sm{border:1px solid ${T.border};background:${T.surfaceAlt};color:${T.textTertiary};padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;align-self:flex-start;transition:all 0.15s}
 .btn-reset-sm:hover{color:${T.text};border-color:${T.borderStrong};transform:translateY(-1px)}
 
@@ -5633,7 +6835,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .assumption-bar{display:flex;align-items:flex-start;gap:8px;padding:12px 16px;margin-bottom:14px;background:${T.goldLight};border:1px solid ${T.borderAccent};border-radius:10px;font-size:12px;color:${T.textSecondary};line-height:1.7}
 .assumption-bar svg{flex-shrink:0;margin-top:3px;color:${T.gold}}
 
-.stale-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;margin-bottom:16px;background:rgba(138,106,46,0.08);border:1px solid rgba(138,106,46,0.25);border-radius:12px;font-size:13px;font-weight:500;color:${T.amber};flex-wrap:wrap}
+.stale-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;margin-bottom:16px;background:${hexA(T.amber, 0.08)};border:1px solid ${hexA(T.amber, 0.25)};border-radius:12px;font-size:13px;font-weight:500;color:${T.amber};flex-wrap:wrap}
 .stale-banner svg{flex-shrink:0}
 .stale-banner .btn-ghost{margin-left:auto;padding:6px 12px;font-size:12px}
 
@@ -5643,6 +6845,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .modal-overlay{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.55);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:24px;animation:staggerIn 0.2s ease-out}
 .modal{width:100%;max-width:400px;background:${T.surface};border:1px solid ${T.borderStrong};border-radius:16px;padding:28px;box-shadow:${T.shadow3};text-align:center}
 .modal-icon{width:48px;height:48px;border-radius:999px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;background:${T.negativeLight};color:${T.negative}}
+.modal-icon.normal{background:${T.goldLight};color:${T.gold}}
 .modal-title{font-size:17px;font-weight:700;margin-bottom:6px;color:${T.text}}
 .modal-text{font-size:13px;color:${T.textSecondary};line-height:1.6;margin-bottom:20px}
 .modal-actions{display:flex;gap:10px}
@@ -5652,6 +6855,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .modal-secondary{background:${T.goldLight};color:${T.gold};border:1px solid ${T.borderAccent}}
 .modal-secondary:hover{filter:brightness(1.1)}
 .modal-confirm{background:${T.negative};color:#fff}
+.modal-confirm.normal{background:${T.gold}}
 .modal-confirm:hover{box-shadow:0 4px 14px rgba(0,0,0,0.25)}
 
 .no-anim,.no-anim .si,.no-anim .stagger-in{animation:none!important}
@@ -5707,8 +6911,9 @@ select option{background:${T.surfaceAlt};color:${T.text}}
   .signal-streak{border-left:none;border-top:1px solid ${T.border};padding:12px 0 0;display:flex;gap:8px;align-items:center}
   .chart-header{flex-direction:column}
   .annual-grid{grid-template-columns:1fr}
-  .nav-tab span{display:none}
-  .nav-tab{padding:10px 14px}
+  .nav-tab span{font-size:10px}
+  .nav-tab{padding:10px 10px;gap:4px}
+  .privacy-label{display:inline}
   .slider-group{gap:10px}
   .range-input::-webkit-slider-thumb{width:28px;height:28px}
   .range-input::-moz-range-thumb{width:28px;height:28px}
@@ -5930,8 +7135,13 @@ const AW_STYLES = `
 .awr {
   --c-bg:#F7F6F3; --c-surface:#FFFFFF; --c-surface-2:#F2F1EE; --c-surface-3:#EDECE9;
   --c-border:rgba(28,28,30,0.08); --c-border-2:rgba(28,28,30,0.14);
-  --c-text:#1C1C1E; --c-text-2:#5C5C60; --c-text-3:#77777D;
+  --c-text:#1C1C1E; --c-text-2:#5C5C60; --c-text-3:#6B6B70;
   --c-accent:#1C1C1E; --c-accent-2:#5C5C60;
+  /* rgb 三元組：讓半透明衍生色（focus 光圈、chip 光暈、hint 漸層）能隨主題換色相 */
+  --c-accent-rgb:28,28,30; --c-red-rgb:166,50,40; --c-green-rgb:45,106,79;
+  /* toast 已改為與宿主一致的主題表面底，內部元素依文字色衍生、雙主題皆可見 */
+  --c-toast-bar:rgba(28,28,30,0.15); --c-toast-bar-fill:rgba(28,28,30,0.5);
+  --c-toast-btn:rgba(28,28,30,0.08); --c-toast-btn-hover:rgba(28,28,30,0.14); --c-toast-dim:rgba(28,28,30,0.45);
   --c-green:#2D6A4F; --c-green-dim:rgba(45,106,79,0.07);
   --c-red:#A63228; --c-red-dim:rgba(166,50,40,0.07);
   --c-yellow:#8A6A2E; --c-yellow-dim:rgba(138,106,46,0.08);
@@ -5941,19 +7151,19 @@ const AW_STYLES = `
   --c-hero-total-border:rgba(28,28,30,0.14);
   --c-hero-total-shadow:0 0 0 1px rgba(28,28,30,0.05),0 8px 24px rgba(28,28,30,0.06);
   --c-hero-total-topline:linear-gradient(90deg,#1C1C1E 0%,#5C5C60 50%,transparent 100%);
-  --c-hero-total-label:#77777D;
+  --c-hero-total-label:#6B6B70;
   --c-hero-total-value:#1C1C1E;
-  --c-hero-total-sub:#77777D;
+  --c-hero-total-sub:#6B6B70;
   --c-hero-total-mini-bg:#F2F1EE;
   --c-hero-total-mini-border:rgba(28,28,30,0.08);
-  --c-hero-total-mini-label:#77777D;
+  --c-hero-total-mini-label:#6B6B70;
   --c-hero-total-mini-value:#1C1C1E;
   --c-chart-grid:rgba(28,28,30,0.05); --c-row-hover:rgba(28,28,30,0.02);
   --c-cat-header-hover:rgba(28,28,30,0.02);
   --c-detail-bg:rgba(242,241,238,0.7); --c-empty-bg:rgba(242,241,238,0.8);
   --c-tooltip-bg:rgba(255,255,255,0.97); --c-tooltip-text:#1C1C1E;
   --c-tooltip-shadow:0 12px 32px rgba(28,28,30,0.1); --c-tooltip-border:rgba(28,28,30,0.08);
-  --c-pie-center-text:#1C1C1E; --c-pie-center-sub:#77777D;
+  --c-pie-center-text:#1C1C1E; --c-pie-center-sub:#6B6B70;
   --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-xl:16px;
   --shadow-sm:0 1px 0 rgba(28,28,30,0.06),0 1px 3px rgba(28,28,30,0.03); --shadow-md:0 0 0 1px rgba(28,28,30,0.06),0 4px 12px rgba(28,28,30,0.04);
   --shadow-lg:0 0 0 1px rgba(28,28,30,0.08),0 8px 24px rgba(28,28,30,0.06); --shadow-glow:0 0 0 rgba(0,0,0,0);
@@ -5966,6 +7176,9 @@ const AW_STYLES = `
   --c-border:rgba(255,255,255,0.06); --c-border-2:rgba(255,255,255,0.12);
   --c-text:#E8EFF8; --c-text-2:#8FA3BE; --c-text-3:#6B7F9E;
   --c-accent:#3B82F6; --c-accent-2:#60A5FA;
+  --c-accent-rgb:59,130,246; --c-red-rgb:239,68,68; --c-green-rgb:16,185,129;
+  --c-toast-bar:rgba(255,255,255,0.18); --c-toast-bar-fill:rgba(255,255,255,0.6);
+  --c-toast-btn:rgba(255,255,255,0.1); --c-toast-btn-hover:rgba(255,255,255,0.18); --c-toast-dim:rgba(255,255,255,0.5);
   --c-green:#10B981; --c-green-dim:rgba(16,185,129,0.12);
   --c-red:#EF4444; --c-red-dim:rgba(239,68,68,0.12);
   --c-yellow:#FBBF24; --c-yellow-dim:rgba(251,191,36,0.1);
@@ -6033,8 +7246,9 @@ button,input,select{font:inherit;}
 
 .btn{border:1px solid var(--c-border-2);background:var(--c-surface-2);border-radius:var(--radius-sm);padding:9px 16px;color:var(--c-text-2);cursor:pointer;transition:all 0.2s cubic-bezier(0.16,1,0.3,1);display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:700;white-space:nowrap;}
 .btn:hover{background:var(--c-surface-3);color:var(--c-text);transform:translateY(-1px);box-shadow:var(--shadow-sm);}
-.btn.primary{color:white;background:linear-gradient(135deg,var(--c-accent),var(--c-accent-2));border-color:transparent;font-weight:700;box-shadow:0 4px 16px rgba(28,28,30,0.22);}
-.btn.primary:hover{box-shadow:0 8px 24px rgba(28,28,30,0.30);}
+/* 與宿主 .btn-primary 的平面純色語言一致，避免同一 App 出現兩種主按鈕造型 */
+.btn.primary{color:white;background:var(--c-accent);border-color:transparent;font-weight:700;}
+.btn.primary:hover{box-shadow:0 4px 14px rgba(var(--c-accent-rgb),0.25);}
 .btn.icon{width:40px;height:40px;justify-content:center;padding:0;}
 .btn:disabled{opacity:0.4;cursor:not-allowed;transform:none;}
 
@@ -6083,13 +7297,13 @@ button,input,select{font:inherit;}
 .fx-box input:focus{border-color:var(--c-accent);}
 .fx-label{display:inline-flex;align-items:center;gap:7px;color:var(--c-text-2);font-size:13px;font-weight:800;}
 .fx-status{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:5px 10px;border-radius:999px;}
-.fx-status.loading{color:var(--c-accent);background:rgba(59,130,246,0.1);}
+.fx-status.loading{color:var(--c-accent);background:rgba(var(--c-accent-rgb),0.1);}
 .fx-status.success{color:var(--c-green);background:var(--c-green-dim);}
 .fx-status.error{color:var(--c-red);background:var(--c-red-dim);}
 .category-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
 .category-chip{border:1px solid var(--c-border-2);background:var(--c-surface-2);border-radius:999px;padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--c-text-2);transition:all 0.2s ease;}
 .category-chip:hover{border-color:var(--c-text-3);color:var(--c-text);}
-.category-chip.active{background:var(--c-accent);color:white;border-color:var(--c-accent);box-shadow:0 4px 12px rgba(59,130,246,0.25);}
+.category-chip.active{background:var(--c-accent);color:white;border-color:var(--c-accent);box-shadow:0 4px 12px rgba(var(--c-accent-rgb),0.25);}
 .category-dot{width:8px;height:8px;border-radius:999px;flex-shrink:0;}
 
 .kpi-grid{margin-top:24px;display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:16px;}
@@ -6114,6 +7328,8 @@ button,input,select{font:inherit;}
 .section-toggle-line{flex:1;height:1px;background:var(--c-border-2);}
 
 .analytics-grid{margin-top:16px;display:grid;grid-template-columns:1.1fr 1fr 1.05fr;gap:16px;}
+/* 平板寬度三欄會把長條圖繪圖區吃光（固定邊距近 160px），比照宿主 1024/1100 中間斷點先收單欄 */
+@media (max-width:1100px){.analytics-grid{grid-template-columns:1fr;}}
 .chart-card{padding:24px;min-height:460px;display:flex;flex-direction:column;}
 .aw-card-title{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:800;color:var(--c-text);margin-bottom:6px;}
 .aw-card-desc{margin-bottom:18px;color:var(--c-text-3);font-size:13px;font-weight:500;line-height:1.6;}
@@ -6128,11 +7344,11 @@ button,input,select{font:inherit;}
 .hint-list::-webkit-scrollbar-thumb{background:var(--c-surface-3);border-radius:4px;}
 .hint{border-radius:var(--radius-md);overflow:hidden;display:flex;transition:all 0.2s ease;border:1px solid transparent;}
 .hint:hover{transform:translateY(-1px);}
-.hint.sell{background:linear-gradient(135deg,rgba(239,68,68,0.06),rgba(239,68,68,0.02));border-color:rgba(239,68,68,0.12);}
-.hint.buy{background:linear-gradient(135deg,rgba(16,185,129,0.06),rgba(16,185,129,0.02));border-color:rgba(16,185,129,0.12);}
+.hint.sell{background:linear-gradient(135deg,rgba(var(--c-red-rgb),0.06),rgba(var(--c-red-rgb),0.02));border-color:rgba(var(--c-red-rgb),0.12);}
+.hint.buy{background:linear-gradient(135deg,rgba(var(--c-green-rgb),0.06),rgba(var(--c-green-rgb),0.02));border-color:rgba(var(--c-green-rgb),0.12);}
 .hint-side{width:64px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
-.hint.sell .hint-side{color:var(--c-red);border-right:1px solid rgba(239,68,68,0.12);}
-.hint.buy .hint-side{color:var(--c-green);border-right:1px solid rgba(16,185,129,0.12);}
+.hint.sell .hint-side{color:var(--c-red);border-right:1px solid rgba(var(--c-red-rgb),0.12);}
+.hint.buy .hint-side{color:var(--c-green);border-right:1px solid rgba(var(--c-green-rgb),0.12);}
 .hint-side-inner{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:10px;font-weight:800;letter-spacing:0.05em;}
 .hint-body{flex:1;padding:14px 16px;}
 .hint-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;}
@@ -6260,7 +7476,7 @@ button,input,select{font:inherit;}
 .form-group+.form-group{margin-top:18px;}
 .form-label{display:block;margin-bottom:8px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--c-text-3);font-weight:700;}
 .form-input{width:100%;height:48px;border-radius:var(--radius-sm);border:1px solid var(--c-border-2);background:var(--c-surface-2);padding:0 14px;text-align:right;font-size:18px;font-family:var(--mono);font-weight:700;color:var(--c-text);outline:none;}
-.form-input:focus{border-color:var(--c-accent);box-shadow:0 0 0 3px rgba(59,130,246,0.15);}
+.form-input:focus{border-color:var(--c-accent);box-shadow:0 0 0 3px rgba(var(--c-accent-rgb),0.15);}
 .settings-actions{display:flex;justify-content:flex-end;margin-top:24px;}
 .settings-done{height:44px;border-radius:var(--radius-sm);border:none;padding:0 20px;background:linear-gradient(135deg,var(--c-accent),var(--c-accent-2));color:white;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(28,28,30,0.18);}
 
@@ -6278,11 +7494,12 @@ button,input,select{font:inherit;}
 .onboard-cta:hover{box-shadow:0 10px 28px rgba(28,28,30,0.35);transform:translateY(-1px);}
 
 .toast-stack{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:300;display:flex;flex-direction:column;gap:10px;pointer-events:none;}
-.aw-toast{display:flex;align-items:center;gap:14px;padding:14px 18px;border-radius:var(--radius-lg);background:var(--c-text);color:var(--c-bg);box-shadow:0 12px 32px rgba(0,0,0,0.25);font-size:13px;font-weight:700;pointer-events:all;min-width:300px;animation:slideUp 0.3s cubic-bezier(0.16,1,0.3,1);}
-.toast-undo-btn{background:rgba(255,255,255,0.18);border:none;color:inherit;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:800;display:flex;align-items:center;gap:5px;transition:background 0.2s;white-space:nowrap;}
-.toast-undo-btn:hover{background:rgba(255,255,255,0.28);}
-.toast-bar{height:3px;background:rgba(255,255,255,0.25);border-radius:999px;overflow:hidden;flex:1;}
-.toast-bar-fill{height:100%;background:rgba(255,255,255,0.6);border-radius:999px;}
+/* 配色/字重向宿主 .toast 靠攏（同主題表面色＋邊框），避免同一 App 兩種 toast 視覺 */
+.aw-toast{display:flex;align-items:center;gap:14px;padding:14px 18px;border-radius:10px;background:var(--c-surface-2);color:var(--c-text);border:1px solid var(--c-border-2);box-shadow:var(--shadow-lg);font-size:13px;font-weight:500;pointer-events:all;min-width:300px;animation:slideUp 0.3s cubic-bezier(0.16,1,0.3,1);}
+.toast-undo-btn{background:var(--c-toast-btn);border:none;color:inherit;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:800;display:flex;align-items:center;gap:5px;transition:background 0.2s;white-space:nowrap;}
+.toast-undo-btn:hover{background:var(--c-toast-btn-hover);}
+.toast-bar{height:3px;background:var(--c-toast-bar);border-radius:999px;overflow:hidden;flex:1;}
+.toast-bar-fill{height:100%;background:var(--c-toast-bar-fill);border-radius:999px;}
 
 .nudge-banner{margin-top:16px;border-radius:var(--radius-lg);padding:16px 20px;background:var(--c-yellow-dim);border:1px solid rgba(138,106,46,0.15);display:flex;align-items:center;gap:14px;}
 .nudge-icon{width:36px;height:36px;border-radius:999px;display:flex;align-items:center;justify-content:center;background:rgba(138,106,46,0.12);color:var(--c-yellow);flex-shrink:0;}
@@ -6292,7 +7509,7 @@ button,input,select{font:inherit;}
 .nudge-dismiss{background:transparent;border:none;color:var(--c-text-3);cursor:pointer;padding:4px;border-radius:4px;display:flex;transition:color 0.2s;}
 .nudge-dismiss:hover{color:var(--c-text);}
 
-.example-banner{margin-top:16px;border-radius:var(--radius-lg);padding:14px 20px;background:rgba(28,28,30,0.06);border:1px solid rgba(28,28,30,0.12);display:flex;align-items:center;gap:12px;}
+.example-banner{margin-top:16px;border-radius:var(--radius-lg);padding:14px 20px;background:rgba(var(--c-accent-rgb),0.06);border:1px solid var(--c-border-2);display:flex;align-items:center;gap:12px;}
 .example-banner-text{flex:1;font-size:12px;color:var(--c-text-2);font-weight:600;line-height:1.5;}
 .example-banner-text strong{color:var(--c-accent);font-weight:800;}
 
@@ -6606,7 +7823,8 @@ function UndoToast({ toasts, onUndo, onDismiss }) {
             style={{
               background: "transparent",
               border: "none",
-              color: "rgba(255,255,255,0.5)",
+              /* 固定白色在淺色 toast 底上會隱形，改用隨主題衍生的次要色 */
+              color: "var(--c-toast-dim)",
               cursor: "pointer",
               padding: "0 0 0 8px",
               display: "flex",
@@ -6663,6 +7881,9 @@ function SkeletonDashboard() {
 
 /* ── Settings Modal Component (proper Esc via useEffect) ── */
 function SettingsModal({ refData, setRefData, onClose }) {
+  // label 需 htmlFor/id 配對，螢幕閱讀器才唸得出欄位名稱
+  const fieldIdBase = useId();
+  const trapRef = useFocusTrap();
   // 編輯中保留原始字串（可清空、可輸入小數點），失焦或關閉時才寫回數字。
   // 原本 onChange 直接 Number(v)||0：欄位一清空立刻變 0、小數點會被吃掉。
   const [draft, setDraft] = useState({
@@ -6706,6 +7927,7 @@ function SettingsModal({ refData, setRefData, onClose }) {
   }, [commitAndClose]);
   return (
     <div
+      ref={trapRef}
       className="modal-overlay"
       role="dialog"
       aria-modal="true"
@@ -6720,8 +7942,9 @@ function SettingsModal({ refData, setRefData, onClose }) {
           基準與匯率設定
         </div>
         <div className="form-group">
-          <label className="form-label">上個月底總資產（台幣）</label>
+          <label className="form-label" htmlFor={`${fieldIdBase}-lm`}>上個月底總資產（台幣）</label>
           <input
+            id={`${fieldIdBase}-lm`}
             className="form-input"
             type="number"
             value={draft.lastMonthValue}
@@ -6743,8 +7966,9 @@ function SettingsModal({ refData, setRefData, onClose }) {
           </div>
         </div>
         <div className="form-group">
-          <label className="form-label">今年年初總資產 YTD（台幣）</label>
+          <label className="form-label" htmlFor={`${fieldIdBase}-sy`}>今年年初總資產 YTD（台幣）</label>
           <input
+            id={`${fieldIdBase}-sy`}
             className="form-input"
             type="number"
             value={draft.startYearValue}
@@ -6755,8 +7979,9 @@ function SettingsModal({ refData, setRefData, onClose }) {
           />
         </div>
         <div className="form-group">
-          <label className="form-label">美元匯率 USD/TWD</label>
+          <label className="form-label" htmlFor={`${fieldIdBase}-fx`}>美元匯率 USD/TWD</label>
           <input
+            id={`${fieldIdBase}-fx`}
             className="form-input"
             type="number"
             step="0.01"
@@ -6777,7 +8002,377 @@ function SettingsModal({ refData, setRefData, onClose }) {
   );
 }
 
-function AssetWarroomTab({ isDark, privacy, active }) {
+/* ═══════════════════════════════════════════════════════
+   圖表 memo 子元件：AssetWarroomTab 是單一巨型元件，任何欄位每打一個字元
+   三張 recharts 圖都會跟著整棵 reconcile；抽成 React.memo、props 只傳
+   圖表所需資料（陣列 reference 有 memo、其餘皆純量），沒變就整張跳過。
+   主題物件（tooltip 樣式等）在子元件內由 isDark 純量建立，
+   不跨 memo 邊界傳物件，才不會每次 render 都打破淺比較 ═══ */
+function awChartTheme(isDark) {
+  return {
+    tooltipStyle: {
+      borderRadius: "8px",
+      border: `1px solid ${
+        isDark ? "rgba(255,255,255,0.12)" : "rgba(28,28,30,0.1)"
+      }`,
+      boxShadow: isDark
+        ? "0 12px 32px rgba(0,0,0,0.5)"
+        : "0 12px 32px rgba(28,28,30,0.1)",
+      fontSize: "12px",
+      fontFamily: "'DM Mono',monospace",
+      background: isDark ? "rgba(26,40,64,0.96)" : "rgba(255,255,255,0.97)",
+      color: isDark ? "#E8EFF8" : "#1C1C1E",
+      backdropFilter: "blur(12px)",
+    },
+    gridColor: isDark ? "rgba(255,255,255,0.05)" : "rgba(28,28,30,0.05)",
+    cursorFill: isDark ? "rgba(255,255,255,0.03)" : "rgba(28,28,30,0.03)",
+    centerColor: isDark ? "#E8EFF8" : "#1C1C1E",
+    centerSubColor: isDark ? "#6B7F9E" : "#6B6B70",
+    /* 軸標 10–11px 小字用三級文字色對比不足 4.5:1，軸標一律升一級（同宿主 textSecondary） */
+    tickColor: isDark ? "#8FA3BE" : "#5C5C60",
+    accent1: isDark ? "#3B82F6" : "#1C1C1E",
+    accent2: isDark ? "#60A5FA" : "#5C5C60",
+    red: isDark ? "#EF4444" : "#A63228",
+    green: isDark ? "#10B981" : "#2D6A4F",
+  };
+}
+
+const AwPieCard = React.memo(function AwPieCard({
+  pieData,
+  assetCount,
+  totalValue,
+  privacyMode,
+  isDark,
+  chartEpoch,
+}) {
+  const th = awChartTheme(isDark);
+  const maskMoney = (formatted) => (privacyMode ? "＊＊＊＊＊" : formatted);
+  return (
+    <div className="aw-card chart-card animate-in delay-4">
+      <div className="aw-card-title">
+        <PieChartIcon size={17} />
+        資產分佈
+      </div>
+      <div className="aw-card-desc">
+        所有資產先換算成台幣後，檢視目前整體配置結構（不受搜尋篩選影響）。
+      </div>
+      <div
+        className="aw-chart-wrap"
+        key={`pie-${chartEpoch}`}
+        role="img"
+        aria-label={`資產分佈圓餅圖${
+          privacyMode ? "" : `，總資產 ${formatCompact(totalValue)}`
+        }`}
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={pieData}
+              innerRadius="62%"
+              outerRadius="85%"
+              paddingAngle={3}
+              dataKey="value"
+              cornerRadius={8}
+              isAnimationActive={false}
+            >
+              {pieData.map((entry, index) => (
+                <Cell key={index} fill={entry.color} stroke="none" />
+              ))}
+              <Label
+                content={({ viewBox }) => {
+                  if (!viewBox || !("cx" in viewBox)) return null;
+                  const { cx, cy } = viewBox;
+                  return (
+                    <text
+                      x={cx}
+                      y={cy}
+                      textAnchor="middle"
+                      dominantBaseline="middle"
+                    >
+                      <tspan
+                        x={cx}
+                        y={cy - 12}
+                        fontSize="11"
+                        fill={th.centerSubColor}
+                        fontWeight="700"
+                      >
+                        {assetCount} 項
+                      </tspan>
+                      <tspan
+                        x={cx}
+                        y={cy + 14}
+                        fontSize="22"
+                        fill={th.centerColor}
+                        fontWeight="700"
+                        fontFamily="DM Mono,monospace"
+                      >
+                        {maskMoney(formatCompact(totalValue))}
+                      </tspan>
+                    </text>
+                  );
+                }}
+              />
+            </Pie>
+            <RechartsTooltip
+              formatter={(val) => maskMoney(formatCurrency(val))}
+              contentStyle={th.tooltipStyle}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="legend-row">
+        {pieData.map((item) => (
+          <div key={item.name} className="legend-item">
+            <span className="legend-dot" style={{ background: item.color }} />
+            {item.name}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+const AwBarCard = React.memo(function AwBarCard({ barData, isDark, chartEpoch }) {
+  const th = awChartTheme(isDark);
+  return (
+    <div className="aw-card chart-card animate-in delay-6">
+      <div className="aw-card-title">
+        <BarChart3 size={17} />
+        類別達標狀況
+      </div>
+      <div className="aw-card-desc">
+        比較各類別目前占比與目標占比的距離（以可投資資產為分母，緊急備用金不列入）。
+      </div>
+      <div
+        className="aw-chart-wrap"
+        style={{ height: 320 }}
+        key={`bar-${chartEpoch}`}
+        role="img"
+        aria-label="類別達標狀況圖，各類別目前占比與目標占比的比較"
+      >
+        {/* right margin 與 YAxis width 是固定 overhead，會在窄容器把繪圖區吃光，故壓到標籤可容納的最小值 */}
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart
+            data={barData}
+            layout="vertical"
+            margin={{ top: 0, right: 72, left: 10, bottom: 0 }}
+            barGap={2}
+            barCategoryGap={18}
+          >
+            <CartesianGrid
+              strokeDasharray="3 3"
+              horizontal={false}
+              stroke={th.gridColor}
+            />
+            <XAxis type="number" hide domain={[0, "dataMax + 10"]} />
+            <YAxis
+              dataKey="name"
+              type="category"
+              width={64}
+              tick={({ x, y, payload }) => (
+                <g transform={`translate(${x},${y})`}>
+                  <text
+                    x={0}
+                    y={0}
+                    dy={4}
+                    textAnchor="end"
+                    fill={th.tickColor}
+                    fontSize={11}
+                    fontWeight={700}
+                  >
+                    {payload.value}
+                  </text>
+                </g>
+              )}
+              axisLine={false}
+              tickLine={false}
+            />
+            <RechartsTooltip
+              cursor={{ fill: th.cursorFill }}
+              contentStyle={th.tooltipStyle}
+              formatter={(val) => [`${val}%`, "占比"]}
+            />
+            <Bar
+              dataKey="目前占比"
+              fill={th.accent1}
+              radius={[0, 6, 6, 0]}
+              barSize={10}
+              fillOpacity={0.6}
+              isAnimationActive={false}
+            />
+            <Bar
+              dataKey="目標占比"
+              fill={th.accent2}
+              radius={[0, 6, 6, 0]}
+              barSize={10}
+              fillOpacity={0.4}
+              isAnimationActive={false}
+            >
+              <LabelList
+                dataKey="gapPct"
+                position="right"
+                content={(props) => {
+                  const { x, y, height, value } = props;
+                  if (x == null || y == null) return null;
+                  const val = Number(value);
+                  const isOver = val > 0;
+                  return (
+                    <text
+                      x={x + 6}
+                      y={y + height / 2 + 4}
+                      fill={isOver ? th.red : th.green}
+                      fontSize={10}
+                      fontWeight="800"
+                    >
+                      {val > 0 ? "+" : ""}
+                      {val}% {isOver ? "超標" : "未達"}
+                    </text>
+                  );
+                }}
+              />
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="legend-row">
+        <div className="legend-item">
+          <span
+            className="legend-dot"
+            style={{ background: th.accent1, opacity: 0.6 }}
+          />
+          目前占比
+        </div>
+        <div className="legend-item">
+          <span
+            className="legend-dot"
+            style={{ background: th.accent2, opacity: 0.4 }}
+          />
+          目標占比
+        </div>
+      </div>
+    </div>
+  );
+});
+
+/* 快照折線圖只抽圖表本體：卡片上的按鈕綁著父層 callback（reference 不穩定），
+   留在父層才不會白白打破 memo */
+const AwSnapshotChart = React.memo(function AwSnapshotChart({
+  data,
+  privacyMode,
+  isDark,
+  chartEpoch,
+}) {
+  const th = awChartTheme(isDark);
+  const maskMoney = (formatted) => (privacyMode ? "＊＊＊＊＊" : formatted);
+  return (
+    <div
+      className="aw-chart-wrap"
+      style={{ height: 320 }}
+      key={`snap-${chartEpoch}`}
+      role="img"
+      aria-label={`快照趨勢折線圖，共 ${data.length} 筆快照${
+        privacyMode || data.length === 0
+          ? ""
+          : `，最新 ${formatCompact(data[data.length - 1].totalValue)}`
+      }`}
+    >
+      {data.length > 0 ? (
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={data}
+            margin={{ top: 10, right: 10, left: 10, bottom: 0 }}
+          >
+            <CartesianGrid strokeDasharray="3 3" stroke={th.gridColor} />
+            <XAxis
+              dataKey="month"
+              tick={{ fontSize: 11, fill: th.tickColor }}
+            />
+            <YAxis
+              tick={{ fontSize: 11, fill: th.tickColor }}
+              tickFormatter={(v) => (privacyMode ? "•" : formatCompact(v))}
+            />
+            <RechartsTooltip
+              formatter={(val) => maskMoney(formatCurrency(val))}
+              contentStyle={th.tooltipStyle}
+            />
+            <Line
+              type="monotone"
+              dataKey="totalValue"
+              stroke={th.accent1}
+              strokeWidth={2.5}
+              isAnimationActive={false}
+              dot={{
+                r: 4,
+                fill: th.accent1,
+                stroke: "var(--c-surface)",
+                strokeWidth: 2,
+              }}
+              activeDot={{ r: 6 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <div className="empty">
+          <div>
+            <div className="empty-icon">
+              <Camera size={22} color="var(--c-text-3)" />
+            </div>
+            <div>
+              目前還沒有月度紀錄
+              <br />
+              按「記錄本月快照」開始追蹤
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+/* 市值輸入格：改本地 draft、onBlur 才 commit——原本每個字元直接 setAssets，
+   整個分頁（含三張圖）都跟著重繪；輸入中只更新本地字串，
+   離開欄位時重用既有的 updateAsset＋sanitizeAssetValue 一次寫入並正規化 */
+function AssetValueCell({ item, inputCurrency, onUpdate, onSanitize }) {
+  // null＝未編輯中，直接顯示外部值（雲端同步、幣別換算才會即時反映）
+  const [draft, setDraft] = useState(null);
+  const shown = draft !== null ? draft : item.value;
+  const isValueInvalid =
+    String(shown).trim() !== "" &&
+    (Number.isNaN(Number(shown)) || Number(shown) < 0);
+  const fmt = (v) =>
+    inputCurrency === "USD" ? formatUsd(v) : formatCurrency(v);
+  return (
+    <>
+      <input
+        className={`value-input ${isValueInvalid ? "invalid" : ""}`}
+        type="number"
+        value={shown}
+        aria-label={`${item.name} 市值（${inputCurrency}）`}
+        title={fmt(shown)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          if (draft !== null) {
+            onUpdate(item.id, "value", draft);
+            onSanitize(item.id);
+          }
+          setDraft(null);
+        }}
+      />
+      <div
+        className={isValueInvalid ? "fx-hint invalid-hint" : "fx-hint"}
+        style={
+          isValueInvalid ? { color: "var(--c-red)", fontWeight: 700 } : {}
+        }
+      >
+        {isValueInvalid ? "數值不可為負數" : fmt(shown)}
+      </div>
+    </>
+  );
+}
+
+/* fireExpense／fireTaxFactor 由主分頁下傳：此分頁自己沒有年支出設定，
+   「可支撐月數」需與總覽 KPI 同口徑（含稅費加成） */
+function AssetWarroomTab({ isDark, privacy, active, fireExpense, fireTaxFactor }) {
   // 只在首次 render 解析 localStorage（原本每次 render 都重新 JSON.parse 整份資料）
   const initialDataRef = useRef(null);
   if (initialDataRef.current === null)
@@ -6876,11 +8471,19 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   // 主題與隱私模式由宿主 App 以 props 傳入
   const privacyMode = privacy;
   const maskMoney = (formatted) => (privacyMode ? "＊＊＊＊＊" : formatted);
+  // 資產明細桌面表格／手機卡片二選一渲染（原本兩份 DOM 常駐靠 CSS 隱藏其一）
+  const isMobile = useIsMobile();
 
   const isInitialLoad = useRef(true);
   const cloudHydratedRef = useRef(false);
   const skipNextCloudSaveRef = useRef(false);
   const lastSyncedJsonRef = useRef("");
+  // 覆蓋守衛用：snapshot handler 是掛載時的閉包讀不到最新 state，
+  // 由 Save Effect 鏡射「目前 state 的 pure JSON」與「本地最後編輯時間」
+  const currentPureJsonRef = useRef("");
+  const awLastLocalEditAtRef = useRef(0);
+  // 關頁 flush 用：指向當前待送出的防抖上傳，pagehide 時立即執行不等 timer
+  const awFlushCloudSaveRef = useRef(null);
 
   const buildCloudPureData = () => ({
     assets,
@@ -6944,9 +8547,13 @@ function AssetWarroomTab({ isDark, privacy, active }) {
     const dynamicCategories = Array.from(
       new Set(assets.map((a) => a.category || "其他"))
     );
-    setCategoryOrder((prev) =>
-      Array.from(new Set([...prev, ...dynamicCategories]))
-    );
+    // 集合沒變就回傳舊 reference：否則每個字元都 set 新陣列，
+    // 觸發第二輪 render＋儲存 effect 重跑、並打破圖表資料的 memo。
+    // 合併只會增加類別，長度比較即足以判斷是否真的有新類別
+    setCategoryOrder((prev) => {
+      const merged = Array.from(new Set([...prev, ...dynamicCategories]));
+      return merged.length === prev.length ? prev : merged;
+    });
   }, [assets]);
 
   // ── Firebase Auth & Sync ──
@@ -6982,13 +8589,35 @@ function AssetWarroomTab({ isDark, privacy, active }) {
               };
               const incomingJson = JSON.stringify(incoming);
               if (incomingJson !== lastSyncedJsonRef.current) {
-                skipNextCloudSaveRef.current = true;
-                setAssets(incoming.assets);
-                setRefData(incoming.refData);
-                setSnapshots(incoming.snapshots);
-                setCategoryOrder(incoming.categoryOrder);
-                localStorage.setItem(AW_STORAGE_KEY, JSON.stringify(incoming));
-                lastSyncedJsonRef.current = incomingJson;
+                // 覆蓋守衛：本地有未上雲的變更（防抖窗、hydration 逾時後的編輯）
+                // 且遠端版本比本地最後編輯舊時，不套用遠端——lastSyncedJsonRef
+                // 保持不變，Save Effect 會偵測差異把本地版本補傳上雲。
+                // updatedAtClient 是後來才加的欄位，舊文件退回解析 updatedAt ISO 字串
+                const remoteAt =
+                  Number(data.updatedAtClient) ||
+                  Date.parse(data.updatedAt || "") ||
+                  0;
+                const hasPending =
+                  currentPureJsonRef.current !== "" &&
+                  currentPureJsonRef.current !== lastSyncedJsonRef.current;
+                if (!hasPending || remoteAt >= awLastLocalEditAtRef.current) {
+                  // 覆蓋 localStorage 前把被取代的本機版本留一份，誤蓋時還有救
+                  try {
+                    const prev = localStorage.getItem(AW_STORAGE_KEY);
+                    if (prev != null && prev !== incomingJson)
+                      localStorage.setItem(
+                        AW_STORAGE_KEY + "_conflict_backup",
+                        prev
+                      );
+                  } catch {}
+                  skipNextCloudSaveRef.current = true;
+                  setAssets(incoming.assets);
+                  setRefData(incoming.refData);
+                  setSnapshots(incoming.snapshots);
+                  setCategoryOrder(incoming.categoryOrder);
+                  localStorage.setItem(AW_STORAGE_KEY, incomingJson);
+                  lastSyncedJsonRef.current = incomingJson;
+                }
               }
               cloudHydratedRef.current = true;
               setIsCloudHydrated(true);
@@ -7001,6 +8630,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                 snapshots,
                 categoryOrder,
                 updatedAt: new Date().toISOString(),
+                updatedAtClient: Date.now(),
               };
               await setDoc(docRef, seedData);
               lastSyncedJsonRef.current = JSON.stringify({
@@ -7037,19 +8667,28 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       isInitialLoad.current = false;
       return;
     }
+    // skip 旗標在「排程時」立即消費：舊版延到 timer 觸發才消費，若使用者在
+    // 500ms 防抖窗內編輯，遠端回寫那次 run 的 timer 被 cleanup 清掉、旗標卻留給
+    // 下一次 run，含編輯的內容會被誤標成「已同步」但從未上傳
+    const isRemoteEcho = skipNextCloudSaveRef.current;
+    skipNextCloudSaveRef.current = false;
+    // 觸發 skip 時的遠端 json：只有內容確實等於它才允許跳過上傳
+    const remoteEchoJson = isRemoteEcho ? lastSyncedJsonRef.current : null;
     // localStorage 立即寫入：宿主的「JSON 完整備份」直接讀這份，
     // 不能有 debounce 空窗（原本延遲 500ms 才寫，備份可能拿到慢半拍的資料）；雲端寫入才防抖
     const pureData = buildCloudPureData();
     const pureJson = JSON.stringify(pureData);
+    currentPureJsonRef.current = pureJson;
+    // 遠端回寫不算本地編輯，不推進本地編輯時間，覆蓋守衛才不會誤把遠端資料當本地新資料
+    if (!isRemoteEcho) awLastLocalEditAtRef.current = Date.now();
     try {
       localStorage.setItem(AW_STORAGE_KEY, pureJson);
     } catch {}
     setSaveStatus("saving");
-    const timer = setTimeout(async () => {
+    const doCloudSave = async () => {
+      awFlushCloudSaveRef.current = null;
       try {
-        if (skipNextCloudSaveRef.current) {
-          skipNextCloudSaveRef.current = false;
-          lastSyncedJsonRef.current = pureJson;
+        if (isRemoteEcho && pureJson === remoteEchoJson) {
           setSaveStatus("saved");
           return;
         }
@@ -7059,6 +8698,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           await setDoc(docRef, {
             ...pureData,
             updatedAt: new Date().toISOString(),
+            updatedAtClient: Date.now(),
           });
           lastSyncedJsonRef.current = pureJson;
         }
@@ -7066,9 +8706,35 @@ function AssetWarroomTab({ isDark, privacy, active }) {
       } catch {
         setSaveStatus("error");
       }
-    }, 500);
-    return () => clearTimeout(timer);
+    };
+    const timer = setTimeout(doCloudSave, 500);
+    awFlushCloudSaveRef.current = () => {
+      // flush 與 timer 都可能觸發：先清 timer，避免同一筆上傳送兩次
+      clearTimeout(timer);
+      doCloudSave();
+    };
+    return () => {
+      clearTimeout(timer);
+      awFlushCloudSaveRef.current = null;
+    };
   }, [assets, refData, snapshots, categoryOrder, isCloudReady]);
+  // 關頁前 flush：與主管線同語意——最後一筆編輯不能只留在 localStorage，
+  // 否則他機一上傳，snapshot 就會把這筆連 localStorage 一起蓋掉
+  useEffect(() => {
+    const flush = () => {
+      const f = awFlushCloudSaveRef.current;
+      if (f) f();
+    };
+    const onVis = () => {
+      if (document.hidden) flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   // ── Auto Snapshot ──
   // 等雲端資料就緒才自動快照，避免用 localStorage 的過期資料建檔
@@ -7360,7 +9026,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         bg: "var(--c-yellow-dim)",
       };
     return {
-      label: "適中",
+      label: "健康",
       color: "var(--c-green)",
       bg: "var(--c-green-dim)",
     };
@@ -7431,14 +9097,29 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         const cat = a.category || "其他";
         targetMap[cat] = (targetMap[cat] || 0) + (Number(a.targetPercent) || 0);
       });
+      // 快照的 percent 以「含緊急備用金的總值」為分母，本期 deviationScore 卻用
+      // 可投資資產——直接比會使上月偏離系統性偏高、縮小/擴大方向可能顛倒。
+      // 改用快照金額扣除備用金後重算占比，與本期同分母（兩分支同修，取逐項加總版）
+      const prevBreakdown = prev.categoryBreakdown || [];
+      const prevInvestable = prevBreakdown.reduce(
+        (sum, i) =>
+          i.category === EMERGENCY_CATEGORY
+            ? sum
+            : sum + (Number(i.value) || 0),
+        0
+      );
       let totalDiff = 0;
-      prev.categoryBreakdown.forEach((i) => {
+      prevBreakdown.forEach((i) => {
         if (i.category === EMERGENCY_CATEGORY) return;
-        totalDiff += Math.abs(i.percent - (targetMap[i.category] || 0));
+        const pct =
+          prevInvestable > 0
+            ? ((Number(i.value) || 0) / prevInvestable) * 100
+            : 0;
+        totalDiff += Math.abs(pct - (targetMap[i.category] || 0));
       });
       Object.keys(targetMap).forEach((cat) => {
         if (cat === EMERGENCY_CATEGORY) return;
-        if (!prev.categoryBreakdown.some((i) => i.category === cat))
+        if (!prevBreakdown.some((i) => i.category === cat))
           totalDiff += Math.abs(targetMap[cat]);
       });
       prevDeviation = Number((totalDiff / 2).toFixed(1));
@@ -7725,6 +9406,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           await setDoc(doc(db, AW_CLOUD_DOC.collection, AW_CLOUD_DOC.doc), {
             ...r,
             updatedAt: new Date().toISOString(),
+            updatedAtClient: Date.now(),
           });
           lastSyncedJsonRef.current = JSON.stringify(r);
         } catch {}
@@ -7742,7 +9424,8 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         openConfirm(
           "匯入失敗",
           "CSV 格式無法解析，請使用與「匯出 CSV」相同的欄位格式（類別、項目、輸入幣別、輸入市值、目標占比）。",
-          () => {}
+          () => {},
+          "normal"
         );
         return;
       }
@@ -7752,7 +9435,8 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         () => {
           downloadPreActionBackup("aw-csv-import");
           setAssets(rows);
-        }
+        },
+        "normal"
       );
     };
     reader.readAsText(file, "utf-8");
@@ -7864,7 +9548,8 @@ function AssetWarroomTab({ isDark, privacy, active }) {
               (a, b) => new Date(b.date) - new Date(a.date)
             );
           });
-        }
+        },
+        "normal"
       );
       return;
     }
@@ -7891,8 +9576,8 @@ function AssetWarroomTab({ isDark, privacy, active }) {
 
 
   const openConfirm = useCallback(
-    (title, message, onConfirm) =>
-      setConfirmDialog({ title, message, onConfirm }),
+    (title, message, onConfirm, variant) =>
+      setConfirmDialog({ title, message, onConfirm, variant }),
     []
   );
   const closeConfirm = useCallback(() => setConfirmDialog(null), []);
@@ -7900,32 +9585,9 @@ function AssetWarroomTab({ isDark, privacy, active }) {
   const manualMode = sortMode === "manual";
 
   /* ─ Chart theme ─ */
-  const chartTooltipStyle = {
-    borderRadius: "8px",
-    border: `1px solid ${
-      isDark ? "rgba(255,255,255,0.12)" : "rgba(28,28,30,0.1)"
-    }`,
-    boxShadow: isDark
-      ? "0 12px 32px rgba(0,0,0,0.5)"
-      : "0 12px 32px rgba(28,28,30,0.1)",
-    fontSize: "12px",
-    fontFamily: "'DM Mono',monospace",
-    background: isDark ? "rgba(26,40,64,0.96)" : "rgba(255,255,255,0.97)",
-    color: isDark ? "#E8EFF8" : "#1C1C1E",
-    backdropFilter: "blur(12px)",
-  };
-  const chartGridColor = isDark
-    ? "rgba(255,255,255,0.05)"
-    : "rgba(28,28,30,0.05)";
-  const chartCursorFill = isDark
-    ? "rgba(255,255,255,0.03)"
-    : "rgba(28,28,30,0.03)";
-  const pieCenterColor = isDark ? "#E8EFF8" : "#1C1C1E";
-  const pieCenterSubColor = isDark ? "#6B7F9E" : "#77777D";
-  const chartAccent1 = isDark ? "#3B82F6" : "#1C1C1E";
-  const chartAccent2 = isDark ? "#60A5FA" : "#5C5C60";
-  const chartRed = isDark ? "#EF4444" : "#A63228";
-  const chartGreen = isDark ? "#10B981" : "#2D6A4F";
+  // 圖表主題色票／tooltip 樣式移入 awChartTheme（memo 子元件內建立），
+  // 物件不再於父層每次 render 重建、也不跨 memo 邊界傳遞；
+  // B 分支的軸標對比修正（tickColor）與淺色 centerSub 色亦已折入 awChartTheme
 
   /* ═══════════════════════════════════════════════════════
      RENDER
@@ -7974,6 +9636,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         <ConfirmModal
           title={confirmDialog.title}
           message={confirmDialog.message}
+          variant={confirmDialog.variant}
           onConfirm={() => {
             confirmDialog.onConfirm();
             closeConfirm();
@@ -8012,6 +9675,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
         </div>
         <div className="mobile-add-form">
           <select
+            aria-label="資產類別"
             value={newAsset.category}
             onChange={(e) =>
               setNewAsset((p) => ({
@@ -8040,6 +9704,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           />
           <div className="mobile-add-form-row">
             <select
+              aria-label="幣別"
               value={newAsset.currency}
               onChange={(e) =>
                 setNewAsset((p) => ({ ...p, currency: e.target.value }))
@@ -8128,7 +9793,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           ) : (
             <>
               <CheckCircle2 size={12} />
-              已保存
+              已儲存
             </>
           )}
         </div>
@@ -8145,17 +9810,17 @@ function AssetWarroomTab({ isDark, privacy, active }) {
           {cloudStatus === "connecting" ? (
             <>
               <Loader2 size={12} className="spin" />
-              連線中
+              同步中
             </>
           ) : cloudStatus === "error" ? (
             <>
               <AlertCircle size={12} />
-              雲端失敗
+              連線失敗
             </>
           ) : (
             <>
               <Cloud size={12} />
-              同步中
+              已同步
             </>
           )}
         </div>
@@ -8223,6 +9888,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                         );
                       } catch {}
                     }}
+                    aria-label="關閉提醒"
                   >
                     <X size={16} />
                   </button>
@@ -8415,6 +10081,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                       </div>
                       <div className="select-box">
                         <select
+                          aria-label="資產排序模式"
                           value={sortMode}
                           onChange={(e) => setSortMode(e.target.value)}
                         >
@@ -8472,19 +10139,25 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                             value={fxDraft ?? String(refData.usdToTwd)}
                             aria-label="美元匯率 USD/TWD"
                             onChange={(e) => {
-                              // 編輯中顯示原始字串（可清空、打小數點不被吃字）；
-                              // 有效正數即時套用，維持原本邊打邊算的行為
-                              const raw = e.target.value;
-                              setFxDraft(raw);
-                              const n = Number(raw);
+                              // 比照 SettingsModal 的 draft-commit：編輯中只留字串，
+                              // 避免打到「3」的瞬間全站就以匯率 3 換算並被防抖寫進儲存
+                              setFxDraft(e.target.value);
+                            }}
+                            onBlur={(e) => {
+                              // 失焦才 commit；無效值（空字串、非正數）還原顯示原值
+                              const n = Number(e.target.value);
                               if (
-                                raw.trim() !== "" &&
+                                e.target.value.trim() !== "" &&
                                 Number.isFinite(n) &&
                                 n > 0
                               )
                                 setRefData((p) => ({ ...p, usdToTwd: n }));
+                              setFxDraft(null);
                             }}
-                            onBlur={() => setFxDraft(null)}
+                            onKeyDown={(e) => {
+                              // Enter 等同失焦提交，維持鍵盤流暢度
+                              if (e.key === "Enter") e.currentTarget.blur();
+                            }}
                           />
                         </div>
                         <button
@@ -8616,9 +10289,16 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                     value={`${cashAssetRatio}%`}
                     subValue={`${maskMoney(
                       formatCompact(cashAssetValue)
-                    )} 可動用現金`}
+                    )} 可動用現金｜${
+                      fireExpense > 0
+                        ? `約可支撐 ${(
+                            cashAssetValue /
+                            ((fireExpense * (fireTaxFactor || 1)) / 12)
+                          ).toFixed(1)} 個月支出`
+                        : "設定年支出後顯示可支撐月數"
+                    }`}
                     badge={cashStatus}
-                    tooltip="現金類資產占總資產的比例。太低缺乏緩衝與加碼空間，太高則拖累長期報酬。"
+                    tooltip="「現金」類資產占總資產的比例，不含緊急備用金。太低缺乏緩衝與加碼空間，太高則拖累長期報酬。可支撐月數＝現金 ÷（年支出 × 稅費加成 ÷ 12），年支出取自總覽的 FIRE 設定。"
                   />
                 </div>
                 {[
@@ -8714,88 +10394,15 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                 <>
                   {/* ── Analytics Grid ── */}
                   <div className="analytics-grid">
-                    {/* Pie Chart */}
-                    <div className="aw-card chart-card animate-in delay-4">
-                      <div className="aw-card-title">
-                        <PieChartIcon size={17} />
-                        資產分佈
-                      </div>
-                      <div className="aw-card-desc">
-                        所有資產先換算成台幣後，檢視目前整體配置結構（不受搜尋篩選影響）。
-                      </div>
-                      <div className="aw-chart-wrap" key={`pie-${chartEpoch}`}>
-                        <ResponsiveContainer width="100%" height="100%">
-                          <PieChart>
-                            <Pie
-                              data={pieData}
-                              innerRadius="62%"
-                              outerRadius="85%"
-                              paddingAngle={3}
-                              dataKey="value"
-                              cornerRadius={8}
-                            >
-                              {pieData.map((entry, index) => (
-                                <Cell
-                                  key={index}
-                                  fill={entry.color}
-                                  stroke="none"
-                                />
-                              ))}
-                              <Label
-                                content={({ viewBox }) => {
-                                  if (!viewBox || !("cx" in viewBox))
-                                    return null;
-                                  const { cx, cy } = viewBox;
-                                  return (
-                                    <text
-                                      x={cx}
-                                      y={cy}
-                                      textAnchor="middle"
-                                      dominantBaseline="middle"
-                                    >
-                                      <tspan
-                                        x={cx}
-                                        y={cy - 12}
-                                        fontSize="11"
-                                        fill={pieCenterSubColor}
-                                        fontWeight="700"
-                                      >
-                                        {assets.length} 項
-                                      </tspan>
-                                      <tspan
-                                        x={cx}
-                                        y={cy + 14}
-                                        fontSize="22"
-                                        fill={pieCenterColor}
-                                        fontWeight="700"
-                                        fontFamily="DM Mono,monospace"
-                                      >
-                                        {maskMoney(formatCompact(totalValue))}
-                                      </tspan>
-                                    </text>
-                                  );
-                                }}
-                              />
-                            </Pie>
-                            <RechartsTooltip
-                              formatter={(val) => maskMoney(formatCurrency(val))}
-                              contentStyle={chartTooltipStyle}
-                            />
-                          </PieChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div className="legend-row">
-                        {pieData.map((item) => (
-                          <div key={item.name} className="legend-item">
-                            <span
-                              className="legend-dot"
-                              style={{ background: item.color }}
-                            />
-                            {item.name}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                    {/* Pie Chart（React.memo 子元件，見 AwPieCard） */}
+                    <AwPieCard
+                      pieData={pieData}
+                      assetCount={assets.length}
+                      totalValue={totalValue}
+                      privacyMode={privacyMode}
+                      isDark={isDark}
+                      chartEpoch={chartEpoch}
+                    />
 
                     {/* Rebalance Hints */}
                     <div className="aw-card chart-card animate-in delay-5">
@@ -8873,122 +10480,12 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                       </div>
                     </div>
 
-                    {/* Bar Chart */}
-                    <div className="aw-card chart-card animate-in delay-6">
-                      <div className="aw-card-title">
-                        <BarChart3 size={17} />
-                        類別達標狀況
-                      </div>
-                      <div className="aw-card-desc">
-                        比較各類別目前占比與目標占比的距離（以可投資資產為分母，緊急備用金不列入）。
-                      </div>
-                      <div
-                        className="aw-chart-wrap"
-                        style={{ height: 320 }}
-                        key={`bar-${chartEpoch}`}
-                      >
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart
-                            data={barData}
-                            layout="vertical"
-                            margin={{ top: 0, right: 95, left: 10, bottom: 0 }}
-                            barGap={2}
-                            barCategoryGap={18}
-                          >
-                            <CartesianGrid
-                              strokeDasharray="3 3"
-                              horizontal={false}
-                              stroke={chartGridColor}
-                            />
-                            <XAxis
-                              type="number"
-                              hide
-                              domain={[0, "dataMax + 10"]}
-                            />
-                            <YAxis
-                              dataKey="name"
-                              type="category"
-                              width={86}
-                              tick={({ x, y, payload }) => (
-                                <g transform={`translate(${x},${y})`}>
-                                  <text
-                                    x={0}
-                                    y={0}
-                                    dy={4}
-                                    textAnchor="end"
-                                    fill={pieCenterSubColor}
-                                    fontSize={11}
-                                    fontWeight={700}
-                                  >
-                                    {payload.value}
-                                  </text>
-                                </g>
-                              )}
-                              axisLine={false}
-                              tickLine={false}
-                            />
-                            <RechartsTooltip
-                              cursor={{ fill: chartCursorFill }}
-                              contentStyle={chartTooltipStyle}
-                              formatter={(val) => [`${val}%`, "占比"]}
-                            />
-                            <Bar
-                              dataKey="目前占比"
-                              fill={chartAccent1}
-                              radius={[0, 6, 6, 0]}
-                              barSize={10}
-                              fillOpacity={0.6}
-                            />
-                            <Bar
-                              dataKey="目標占比"
-                              fill={chartAccent2}
-                              radius={[0, 6, 6, 0]}
-                              barSize={10}
-                              fillOpacity={0.4}
-                            >
-                              <LabelList
-                                dataKey="gapPct"
-                                position="right"
-                                content={(props) => {
-                                  const { x, y, height, value } = props;
-                                  if (x == null || y == null) return null;
-                                  const val = Number(value);
-                                  const isOver = val > 0;
-                                  return (
-                                    <text
-                                      x={x + 6}
-                                      y={y + height / 2 + 4}
-                                      fill={isOver ? chartRed : chartGreen}
-                                      fontSize={10}
-                                      fontWeight="800"
-                                    >
-                                      {val > 0 ? "+" : ""}
-                                      {val}% {isOver ? "超標" : "未達"}
-                                    </text>
-                                  );
-                                }}
-                              />
-                            </Bar>
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div className="legend-row">
-                        <div className="legend-item">
-                          <span
-                            className="legend-dot"
-                            style={{ background: chartAccent1, opacity: 0.6 }}
-                          />
-                          當前佔比
-                        </div>
-                        <div className="legend-item">
-                          <span
-                            className="legend-dot"
-                            style={{ background: chartAccent2, opacity: 0.4 }}
-                          />
-                          目標佔比
-                        </div>
-                      </div>
-                    </div>
+                    {/* Bar Chart（React.memo 子元件，見 AwBarCard） */}
+                    <AwBarCard
+                      barData={barData}
+                      isDark={isDark}
+                      chartEpoch={chartEpoch}
+                    />
                   </div>
 
                   {/* ── Monthly Grid ── */}
@@ -9020,72 +10517,13 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                           </button>
                         )}
                       </div>
-                      <div
-                        className="aw-chart-wrap"
-                        style={{ height: 320 }}
-                        key={`snap-${chartEpoch}`}
-                      >
-                        {snapshotChartData.length > 0 ? (
-                          <ResponsiveContainer width="100%" height="100%">
-                            <LineChart
-                              data={snapshotChartData}
-                              margin={{
-                                top: 10,
-                                right: 10,
-                                left: 10,
-                                bottom: 0,
-                              }}
-                            >
-                              <CartesianGrid
-                                strokeDasharray="3 3"
-                                stroke={chartGridColor}
-                              />
-                              <XAxis
-                                dataKey="month"
-                                tick={{ fontSize: 11, fill: pieCenterSubColor }}
-                              />
-                              <YAxis
-                                tick={{ fontSize: 11, fill: pieCenterSubColor }}
-                                tickFormatter={(v) =>
-                                  privacyMode ? "•" : formatCompact(v)
-                                }
-                              />
-                              <RechartsTooltip
-                                formatter={(val) =>
-                                  maskMoney(formatCurrency(val))
-                                }
-                                contentStyle={chartTooltipStyle}
-                              />
-                              <Line
-                                type="monotone"
-                                dataKey="totalValue"
-                                stroke={chartAccent1}
-                                strokeWidth={2.5}
-                                dot={{
-                                  r: 4,
-                                  fill: chartAccent1,
-                                  stroke: "var(--c-surface)",
-                                  strokeWidth: 2,
-                                }}
-                                activeDot={{ r: 6 }}
-                              />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        ) : (
-                          <div className="empty">
-                            <div>
-                              <div className="empty-icon">
-                                <Camera size={22} color="var(--c-text-3)" />
-                              </div>
-                              <div>
-                                目前還沒有月度紀錄
-                                <br />
-                                按「記錄本月快照」開始追蹤
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
+                      {/* 折線圖本體抽成 React.memo 子元件（AwSnapshotChart） */}
+                      <AwSnapshotChart
+                        data={snapshotChartData}
+                        privacyMode={privacyMode}
+                        isDark={isDark}
+                        chartEpoch={chartEpoch}
+                      />
                     </div>
                     <div className="aw-card monthly-card animate-in delay-6">
                       <div className="aw-card-title">
@@ -9123,7 +10561,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                           {
                             label: "占比最大類別",
                             value: monthlySummary.biggestCategory,
-                            sub: `目前佔比 ${monthlySummary.biggestCategoryPercent}`,
+                            sub: `目前占比 ${monthlySummary.biggestCategoryPercent}`,
                             cls: "",
                           },
                           {
@@ -9267,6 +10705,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                     >
                       <div className="add-inline-form">
                         <select
+                          aria-label="資產類別"
                           value={newAsset.category}
                           onChange={(e) =>
                             setNewAsset((p) => ({
@@ -9299,6 +10738,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                           }}
                         />
                         <select
+                          aria-label="幣別"
                           value={newAsset.currency}
                           onChange={(e) =>
                             setNewAsset((p) => ({
@@ -9411,7 +10851,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                     const isExpanded = expandedCategories[cat];
                     const catColor = getCategoryColor(cat, isDark);
                     const isEmergencyCat = cat === EMERGENCY_CATEGORY;
-                    // 備用金顯示佔總資產比例；其餘類別以可投資資產為分母對比目標
+                    // 備用金顯示占總資產比例；其餘類別以可投資資產為分母對比目標
                     const catDenom = isEmergencyCat
                       ? totalValue
                       : investableValue;
@@ -9483,7 +10923,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                             </div>
                             <div className="cat-box">
                               <div className="cat-label">
-                                {isEmergencyCat ? "佔總資產" : "目前 / 目標"}
+                                {isEmergencyCat ? "占總資產" : "目前 / 目標"}
                               </div>
                               <div className="cat-value">
                                 <strong>{catCurrentPct}%</strong>
@@ -9519,6 +10959,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                               >
                                 <button
                                   className="sort-btn"
+                                  aria-label={`${cat} 上移`}
                                   onClick={() => moveCategory(cat, "up")}
                                   disabled={catIndex <= 0}
                                 >
@@ -9526,6 +10967,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                 </button>
                                 <button
                                   className="sort-btn"
+                                  aria-label={`${cat} 下移`}
                                   onClick={() => moveCategory(cat, "down")}
                                   disabled={
                                     catIndex >= orderedCategories.length - 1
@@ -9540,6 +10982,9 @@ function AssetWarroomTab({ isDark, privacy, active }) {
 
                         {isExpanded && (
                           <div className="category-detail">
+                            {/* 桌面表格／手機卡片二選一渲染：原本兩份完整清單
+                                常駐 DOM、僅靠 CSS 隱藏其一，每字元付雙倍成本 */}
+                            {!isMobile && (
                             <div className="detail-table-wrap">
                               <table className="detail-table">
                                 <thead>
@@ -9628,10 +11073,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                     const isActionOver = diff > 0;
                                     const inputCurrency =
                                       getDisplayCurrency(item);
-                                    const isValueInvalid =
-                                      String(item.value).trim() !== "" &&
-                                      (Number.isNaN(Number(item.value)) ||
-                                        Number(item.value) < 0);
+                                    // 市值合法性判斷移入 AssetValueCell（本地 draft 內即時檢查）
 
                                     return (
                                       <tr key={item.id}>
@@ -9713,58 +11155,12 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                               ＊＊＊＊＊
                                             </div>
                                           ) : (
-                                            <>
-                                              <input
-                                                className={`value-input ${
-                                                  isValueInvalid
-                                                    ? "invalid"
-                                                    : ""
-                                                }`}
-                                                type="number"
-                                                value={item.value}
-                                                aria-label={`${item.name} 市值（${inputCurrency}）`}
-                                                title={
-                                                  inputCurrency === "USD"
-                                                    ? formatUsd(item.value)
-                                                    : formatCurrency(
-                                                        item.value
-                                                      )
-                                                }
-                                                onChange={(e) =>
-                                                  updateAsset(
-                                                    item.id,
-                                                    "value",
-                                                    e.target.value
-                                                  )
-                                                }
-                                                onBlur={() =>
-                                                  sanitizeAssetValue(item.id)
-                                                }
-                                              />
-                                              <div
-                                                className={
-                                                  isValueInvalid
-                                                    ? "fx-hint invalid-hint"
-                                                    : "fx-hint"
-                                                }
-                                                style={
-                                                  isValueInvalid
-                                                    ? {
-                                                        color: "var(--c-red)",
-                                                        fontWeight: 700,
-                                                      }
-                                                    : {}
-                                                }
-                                              >
-                                                {isValueInvalid
-                                                  ? "數值不可為負數"
-                                                  : inputCurrency === "USD"
-                                                  ? formatUsd(item.value)
-                                                  : formatCurrency(
-                                                      item.value
-                                                    )}
-                                              </div>
-                                            </>
+                                            <AssetValueCell
+                                              item={item}
+                                              inputCurrency={inputCurrency}
+                                              onUpdate={updateAsset}
+                                              onSanitize={sanitizeAssetValue}
+                                            />
                                           )}
                                         </td>
                                         <td
@@ -9856,6 +11252,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                             >
                                               <button
                                                 className="sort-btn"
+                                                aria-label={`${item.name || "資產"} 上移`}
                                                 onClick={() =>
                                                   moveAssetWithinCategory(
                                                     item.id,
@@ -9873,6 +11270,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                               </button>
                                               <button
                                                 className="sort-btn"
+                                                aria-label={`${item.name || "資產"} 下移`}
                                                 onClick={() =>
                                                   moveAssetWithinCategory(
                                                     item.id,
@@ -9895,6 +11293,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                           <button
                                             className="delete-btn"
                                             title="刪除"
+                                            aria-label={`刪除 ${item.name || "資產"}`}
                                             onClick={() =>
                                               handleDeleteRequest(item.id)
                                             }
@@ -9908,9 +11307,11 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                 </tbody>
                               </table>
                             </div>
+                            )}
 
                             {/* Mobile Cards */}
-                            {stat.items.map((item) => {
+                            {isMobile &&
+                              stat.items.map((item) => {
                               const twdValue = convertAssetToTwd(
                                 item,
                                 refData.usdToTwd
@@ -9942,6 +11343,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                     </div>
                                     <button
                                       className="delete-btn"
+                                      aria-label={`刪除 ${item.name || "資產"}`}
                                       onClick={() =>
                                         handleDeleteRequest(item.id)
                                       }
@@ -9973,7 +11375,7 @@ function AssetWarroomTab({ isDark, privacy, active }) {
                                     <div className="mobile-asset-card-field">
                                       <div className="mobile-asset-card-field-label">
                                         {isEmergencyCat
-                                          ? "佔總資產"
+                                          ? "占總資產"
                                           : "目標 / 目前"}
                                       </div>
                                       <div
