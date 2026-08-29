@@ -1680,6 +1680,15 @@ export default function App() {
                   return recs;
                 });
                 setCloudState("已同步");
+              } else if (Array.isArray(rr)) {
+                // 雲端明確存了空清單（例如把紀錄刪光）：這是有效的遠端狀態，
+                // 不是「待建立的新文件」。遠端基準必須設成空清單本身，否則
+                // 「空回音 → 視為新文件（基準="") → 防抖偵測差異又上傳 []
+                // → 又回音」會無限迴圈，晶片永遠卡在上傳中
+                remoteAppliedRef.current = true;
+                setCloudReady(true);
+                remoteJsonRef.current = JSON.stringify(normalizeRecords([]));
+                setCloudState("已同步");
               } else {
                 remoteAppliedRef.current = true;
                 setCloudReady(true);
