@@ -1770,8 +1770,12 @@ export default function App() {
         remoteEventsRef.current = cej;
         setCloudState("已同步");
         setSaveStatus(`已同步 ${new Date().toLocaleTimeString("zh-TW")}`);
-      } catch {
-        setCloudState("儲存失敗");
+      } catch (e) {
+        console.error("[CloudSync] save error:", e);
+        setCloudState(
+          "儲存失敗:" +
+            String(e?.code || e?.message || "unknown").substring(0, 40)
+        );
       }
     };
     saveTimerRef.current = setTimeout(doSave, 700);
