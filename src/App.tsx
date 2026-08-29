@@ -85,6 +85,7 @@ import {
   ArrowDown,
   CornerUpLeft,
   PieChart as PieChartIcon,
+  Users,
 } from "lucide-react";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getAuth, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, inMemoryPersistence, signInAnonymously, onAuthStateChanged } from "firebase/auth";
@@ -97,8 +98,32 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 
-const STORAGE_KEY = "bestea_asset_growth_cash_other_compact_v1";
-const CLOUD_DOC_PATH = ["warrooms", "asset-growth-war-room-v1"];
+/* ─── 帳本切換（me＝我的／wife＝老婆的） ───
+   同一個 Firebase 專案下，用「不同雲端文件＋不同本機鍵」讓兩本帳完全隔離。
+   選擇存在 agwr_active_book（不分帳本），切換時整頁 reload 重新初始化，
+   模組啟動後以下所有常數即固定為當前帳本的值。主題／隱私／分頁等純 UI
+   偏好刻意共用（操作的是同一個人）。 */
+const ACTIVE_BOOK = (() => {
+  try {
+    return localStorage.getItem("agwr_active_book") === "wife" ? "wife" : "me";
+  } catch {
+    return "me";
+  }
+})();
+const IS_WIFE_BOOK = ACTIVE_BOOK === "wife";
+const BOOK_SUFFIX = IS_WIFE_BOOK ? "_wife" : "";
+const BOOK_LABEL = IS_WIFE_BOOK ? "老婆的帳本" : "我的帳本";
+function switchBook() {
+  try {
+    localStorage.setItem("agwr_active_book", IS_WIFE_BOOK ? "me" : "wife");
+  } catch {}
+  location.reload();
+}
+const STORAGE_KEY = "bestea_asset_growth_cash_other_compact_v1" + BOOK_SUFFIX;
+const CLOUD_DOC_PATH = [
+  "warrooms",
+  "asset-growth-war-room-v1" + (IS_WIFE_BOOK ? "-wife" : ""),
+];
 const firebaseConfig = {
   apiKey: "AIzaSyCbOt1oq1pUjv7itsgNaTuDR3qw-5azbLU",
   authDomain: "premium-wealth-command-center.firebaseapp.com",
@@ -637,7 +662,7 @@ function persistLocal(r) {
 }
 // goal／FIRE 設定的本機備援：records 有 persistLocal、fireSwr 有 agwr_fire_swr，
 // 這三個欄位過去只存在雲端文件，離線重整就歸零；比照 records 補上備援
-const GOAL_FIRE_BACKUP_KEY = "agwr_goal_fire_backup";
+const GOAL_FIRE_BACKUP_KEY = "agwr_goal_fire_backup" + BOOK_SUFFIX;
 function loadGoalFireBackup() {
   try {
     const p = JSON.parse(localStorage.getItem(GOAL_FIRE_BACKUP_KEY) || "null");
@@ -979,7 +1004,7 @@ function downloadPreActionBackup(tag) {
     const u = URL.createObjectURL(b);
     const a = document.createElement("a");
     a.href = u;
-    a.download = `auto-backup-before-${tag}-${new Date()
+    a.download = `auto-backup${BOOK_SUFFIX}-before-${tag}-${new Date()
       .toISOString()
       .slice(0, 19)
       .replace(/[T:]/g, "")}.json`;
@@ -1333,7 +1358,9 @@ export default function App() {
   const [scenarioEvents, setScenarioEvents] = useState(() => {
     try {
       return normalizeScenarioEvents(
-        JSON.parse(localStorage.getItem("agwr_scenario_events") || "[]")
+        JSON.parse(
+          localStorage.getItem("agwr_scenario_events" + BOOK_SUFFIX) || "[]"
+        )
       );
     } catch {
       return [];
@@ -1342,7 +1369,7 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem(
-        "agwr_scenario_events",
+        "agwr_scenario_events" + BOOK_SUFFIX,
         JSON.stringify(normalizeScenarioEvents(scenarioEvents))
       );
     } catch {}
@@ -1350,7 +1377,7 @@ export default function App() {
   // 通膨假設（%／年）：長天期名目值購買力會失真，供情境模擬「實質」模式與 FIRE 門檻共用
   const [inflationPct, setInflationPct] = useState(() => {
     try {
-      const v = Number(localStorage.getItem("agwr_inflation"));
+      const v = Number(localStorage.getItem("agwr_inflation" + BOOK_SUFFIX));
       return Number.isFinite(v) && v >= 0 && v <= 5 ? v : 2;
     } catch {
       return 2;
@@ -1358,7 +1385,10 @@ export default function App() {
   });
   useEffect(() => {
     try {
-      localStorage.setItem("agwr_inflation", String(inflationPct));
+      localStorage.setItem(
+        "agwr_inflation" + BOOK_SUFFIX,
+        String(inflationPct)
+      );
     } catch {}
   }, [inflationPct]);
   // 情境模擬顯示口徑：名目金額（預設）／實質購買力（折算回今日物價）
@@ -1986,7 +2016,7 @@ export default function App() {
   // 提早退休（40 年以上）學界普遍建議 3.25~3.5%。選擇存在本機。
   const [fireSwr, setFireSwr] = useState(() => {
     try {
-      const v = Number(localStorage.getItem("agwr_fire_swr"));
+      const v = Number(localStorage.getItem("agwr_fire_swr" + BOOK_SUFFIX));
       return [4, 3.5, 3.25].includes(v) ? v : 4;
     } catch {
       return 4;
@@ -1994,7 +2024,7 @@ export default function App() {
   });
   useEffect(() => {
     try {
-      localStorage.setItem("agwr_fire_swr", String(fireSwr));
+      localStorage.setItem("agwr_fire_swr" + BOOK_SUFFIX, String(fireSwr));
     } catch {}
   }, [fireSwr]);
   // 樂觀警示：模擬用的 μ 年化超過 10% 時提醒（牛市 12 個月的統計外推 20 年會失真）
@@ -2289,9 +2319,13 @@ export default function App() {
   const backupDue = useMemo(() => {
     try {
       const now = Date.now();
-      const snooze = Number(localStorage.getItem("agwr_backup_snooze") || 0);
+      const snooze = Number(
+        localStorage.getItem("agwr_backup_snooze" + BOOK_SUFFIX) || 0
+      );
       if (now - snooze < 30 * 864e5) return null;
-      const last = Number(localStorage.getItem("agwr_last_backup") || 0);
+      const last = Number(
+        localStorage.getItem("agwr_last_backup" + BOOK_SUFFIX) || 0
+      );
       if (!last) return { never: true };
       const days = Math.floor((now - last) / 864e5);
       return days >= 60 ? { days } : null;
@@ -2658,7 +2692,7 @@ export default function App() {
     const u = URL.createObjectURL(b);
     const a = document.createElement("a");
     a.href = u;
-    a.download = `asset-growth-backup-${new Date()
+    a.download = `asset-growth-backup${BOOK_SUFFIX}-${new Date()
       .toISOString()
       .slice(0, 10)}.json`;
     document.body.appendChild(a);
@@ -2668,7 +2702,10 @@ export default function App() {
     setToast("備份已下載");
     // 記錄備份時間供提醒橫幅判斷
     try {
-      localStorage.setItem("agwr_last_backup", String(Date.now()));
+      localStorage.setItem(
+        "agwr_last_backup" + BOOK_SUFFIX,
+        String(Date.now())
+      );
     } catch {}
     setBackupPromptTick((t) => t + 1);
   };
@@ -3039,6 +3076,21 @@ export default function App() {
           )}
           <button
             className="btn-ghost"
+            onClick={switchBook}
+            title={`目前是「${BOOK_LABEL}」，點擊切換到「${
+              IS_WIFE_BOOK ? "我的帳本" : "老婆的帳本"
+            }」（頁面會重新載入，資料完全分開）`}
+            style={{
+              padding: "8px 12px",
+              fontWeight: 700,
+              color: IS_WIFE_BOOK ? T.gold : undefined,
+            }}
+          >
+            <Users size={16} />
+            <span className="privacy-label">{BOOK_LABEL}</span>
+          </button>
+          <button
+            className="btn-ghost"
             onClick={() => setPrivacy((p) => !p)}
             title={privacy ? "顯示金額" : "隱藏金額（隱私模式）"}
             aria-pressed={privacy}
@@ -3353,7 +3405,7 @@ export default function App() {
                 onClick={() => {
                   try {
                     localStorage.setItem(
-                      "agwr_backup_snooze",
+                      "agwr_backup_snooze" + BOOK_SUFFIX,
                       String(Date.now())
                     );
                   } catch {}
@@ -6825,8 +6877,11 @@ select option{background:${T.surfaceAlt};color:${T.text}}
    CONSTANTS & CONFIG
    ═══════════════════════════════════════════════════════ */
 
-const AW_STORAGE_KEY = "asset_warroom_pro_v104_currency_final";
-const AW_CLOUD_DOC = { collection: "warrooms", doc: "shared_asset_warroom" };
+const AW_STORAGE_KEY = "asset_warroom_pro_v104_currency_final" + BOOK_SUFFIX;
+const AW_CLOUD_DOC = {
+  collection: "warrooms",
+  doc: "shared_asset_warroom" + (IS_WIFE_BOOK ? "_wife" : ""),
+};
 
 // Firebase 與宿主共用 getFirebaseServices()（同一專案，不同文件）
 const RechartsTooltip = Tooltip;
