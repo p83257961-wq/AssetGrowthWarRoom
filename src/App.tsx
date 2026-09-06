@@ -3068,7 +3068,9 @@ export default function App() {
         </div>
         <div className="header-right">
           <div
-            className="cloud-status"
+            className={`cloud-status ${
+              cloudState.includes("失敗") ? "is-fail" : ""
+            }`}
             style={{ color: cloudColor }}
             // 原始錯誤碼對一般使用者無意義，收進 title 供除錯；畫面只講後果與現況
             title={cloudState.includes("失敗") ? cloudState : undefined}
@@ -3088,19 +3090,16 @@ export default function App() {
             </button>
           )}
           <button
-            className="btn-ghost"
+            className={`btn-ghost book-btn ${IS_WIFE_BOOK ? "wife" : ""}`}
             onClick={switchBook}
             title={`目前是「${BOOK_LABEL}」，點擊切換到「${
               IS_WIFE_BOOK ? "我的帳本" : "老婆的帳本"
             }」（頁面會重新載入，資料完全分開）`}
-            style={{
-              padding: "8px 12px",
-              fontWeight: 700,
-              color: IS_WIFE_BOOK ? T.gold : undefined,
-            }}
+            aria-label={`目前帳本：${BOOK_LABEL}，點擊切換`}
+            style={{ padding: "8px 12px" }}
           >
             <Users size={16} />
-            <span className="privacy-label">{BOOK_LABEL}</span>
+            <span className="book-label">{BOOK_LABEL}</span>
           </button>
           <button
             className="btn-ghost"
@@ -6579,6 +6578,11 @@ table{border-collapse:collapse}
 .cloud-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:8px 12px;background:${T.surface};border:1px solid ${T.border};border-radius:8px;transition:all 0.15s}
 /* 隱私模式鈕的極小 label：桌機有 hover title 不必顯示，觸控裝置沒有 title 才靠它辨識 */
 .privacy-label{display:none;font-size:10px;font-weight:700;letter-spacing:0.05em}
+/* 帳本標籤：永遠顯示（不比照 privacy-label 只在手機出現）——
+   「現在在哪本帳」是輸入資料前必須確認的狀態，看不見就會記錯本 */
+.book-label{display:inline;font-size:11px;font-weight:700;letter-spacing:0.03em}
+.book-btn.wife{background:${T.gold}1F;border-color:${T.gold};color:${T.gold}}
+.book-btn.wife:hover{background:${T.gold}30}
 
 .btn-ghost{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:1px solid ${T.border};background:${T.surface};border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:${T.text};transition:all 0.2s cubic-bezier(0.16,1,0.3,1)}
 .btn-ghost:hover{border-color:${T.borderStrong};box-shadow:${T.shadow1};transform:translateY(-1px)}
@@ -6860,8 +6864,8 @@ input:focus-visible,select:focus-visible{outline:none}
 select option{background:${T.surfaceAlt};color:${T.text}}
 
 @media(max-width:640px){
-  .header{flex-direction:column;align-items:flex-start;gap:12px}
-  .header-right{width:100%;justify-content:flex-start}
+  .header{flex-direction:column;align-items:flex-start;gap:10px;margin-bottom:16px}
+  .header-right{width:100%;justify-content:flex-start;gap:6px}
   .hero-kpi{padding:24px 20px}
   .hero-value{font-size:28px}
   .signal-card{flex-direction:column;gap:12px;padding:16px 20px}
@@ -6870,12 +6874,35 @@ select option{background:${T.surfaceAlt};color:${T.text}}
   .annual-grid{grid-template-columns:1fr}
   .nav-tab span{font-size:10px}
   .nav-tab{padding:10px 10px;gap:4px}
-  .privacy-label{display:inline}
   .slider-group{gap:10px}
   .range-input::-webkit-slider-thumb{width:28px;height:28px}
   .range-input::-moz-range-thumb{width:28px;height:28px}
   .card{padding:18px;border-radius:14px}
   .form-body{gap:16px}
+  /* ── 手機專屬精簡（桌機不受影響）────────────────────────
+     手機寬度是稀缺資源：圖示已經說明的狀態就不再重複用文字說一次 */
+  /* 隱私狀態看圖示（👁／👁‍🗨）與打碼數字即知，文字標籤省略 */
+  .privacy-label{display:none}
+  /* 雲端正常時只留圖示；失敗時（.is-fail）保留完整說明，這才是需要讀的訊息 */
+  .cloud-status{padding:8px 10px}
+  .cloud-status:not(.is-fail) span{display:none}
+  /* 頂欄按鈕統一 40px 觸控高度，換行時各列對齊 */
+  .btn-ghost,.btn-primary{min-height:40px;padding:8px 12px}
+  /* 五個分頁平均分配寬度並隱藏捲軸，不再出現半個分頁的殘影 */
+  .nav-tabs{margin-bottom:16px;scrollbar-width:none}
+  .nav-tabs::-webkit-scrollbar{display:none}
+  .nav-tab{flex:1;justify-content:center}
+  /* 標題與說明降一級，讓數字維持視覺主角 */
+  .section-title{font-size:16px;margin-bottom:12px}
+  .card-title{font-size:15px}
+  .card-desc{font-size:12px;line-height:1.6}
+  .assumption-bar{font-size:11px;padding:10px 12px;line-height:1.6}
+  .alert{font-size:12px;padding:10px 12px}
+  .kpi-strip{gap:8px}
+  /* iOS Safari 對 <16px 的輸入框會自動放大整頁，輸入金額時畫面亂跳的元凶。
+     裸 input 選擇器會被 .field-input 等 class 規則蓋過，需一併點名 */
+  input,select,textarea,.field-input,.search-input{font-size:16px}
+  .app-root{padding:12px 12px 72px}
 }
 `;
 
@@ -7509,6 +7536,21 @@ button,input,select{font:inherit;}
   .mobile-asset-card{display:block;}
   .analytics-grid,.monthly-grid{grid-template-columns:1fr;}
   .delete-btn{width:44px;height:44px;}
+  /* ── 手機專屬精簡（桌機不受影響）──────────────────────── */
+  /* 總市值卡：內距與兩張小卡縮一號，主數字不被擠到換行 */
+  .hero-total-box{padding:20px 18px;}
+  .hero-total-mini{padding:10px 12px;}
+  .hero-total-mini-value{font-size:18px;}
+  .hero-total-sub{font-size:12px;margin-top:12px;line-height:1.7;}
+  /* KPI 數字降一級並取消最小高度，四張卡不再各佔半個螢幕 */
+  .aw-kpi-value{font-size:26px;}
+  .kpi-card{padding:18px;min-height:0;}
+  /* 工具列改靠左（與內容同一條左緣），狀態膠囊縮小讓按鈕留在同一列 */
+  .aw-toolbar{justify-content:flex-start;gap:6px;padding:12px 0 4px;}
+  .status-pill{font-size:10px;padding:5px 8px;}
+  .btn{min-height:40px;}
+  /* 同上：手機上實際會被點選的輸入框都拉到 16px，避免 iOS 自動放大 */
+  .mobile-add-form select,.mobile-add-form input,.aw-search-box input,.fx-box input{font-size:16px;}
 }
 `;
 
