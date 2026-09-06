@@ -6562,6 +6562,15 @@ table{border-collapse:collapse}
 
 .app-root{max-width:1400px;margin:0 auto;padding:24px 24px 80px}
 @media(max-width:768px){.app-root{padding:16px 16px 64px}}
+/* ── 手機捲動長度：圖表是最大宗的垂直佔位（340~360px＋卡片內距＋標題
+   ≈ 一個圖表吃掉七成螢幕），一律封頂 240px。
+   用 max-height 而非 height：recharts 以 inline style 設 height，
+   max-height 是不同屬性所以不需要 !important，且只做上限不會把
+   本來就矮的圖（如 180px 回撤圖）拉高；ResponsiveContainer 的
+   ResizeObserver 量到實際高度後會自動依新尺寸重繪。 */
+@media(max-width:768px){
+  .recharts-responsive-container{max-height:240px}
+}
 
 .toast-host{position:fixed;top:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
 .toast{pointer-events:auto;background:${T.surfaceAlt};color:${T.text};border:1px solid ${T.border};padding:12px 20px;border-radius:10px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;box-shadow:${T.shadow3};animation:staggerIn 0.3s ease-out}
@@ -6877,8 +6886,13 @@ select option{background:${T.surfaceAlt};color:${T.text}}
   .slider-group{gap:10px}
   .range-input::-webkit-slider-thumb{width:28px;height:28px}
   .range-input::-moz-range-thumb{width:28px;height:28px}
-  .card{padding:18px;border-radius:14px}
+  .card{padding:18px;border-radius:14px;margin-bottom:12px}
   .form-body{gap:16px}
+  /* 圖表外框與統計卡的內距同步縮一號：單看省不多，
+     但一頁十幾個區塊累積起來就是一整個螢幕的捲動 */
+  .chart-wrap{padding:12px 4px 8px 0}
+  .kpi-item{padding:12px}
+  .annual-card{padding:16px}
   /* ── 手機專屬精簡（桌機不受影響）────────────────────────
      手機寬度是稀缺資源：圖示已經說明的狀態就不再重複用文字說一次 */
   /* 隱私狀態看圖示（👁／👁‍🗨）與打碼數字即知，文字標籤省略 */
@@ -7551,6 +7565,15 @@ button,input,select{font:inherit;}
   .btn{min-height:40px;}
   /* 同上：手機上實際會被點選的輸入框都拉到 16px，避免 iOS 自動放大 */
   .mobile-add-form select,.mobile-add-form input,.aw-search-box input,.fx-box input{font-size:16px;}
+  /* 小型統計格在手機維持 2 欄（必須寫在上面那條 1fr 之後才會生效）：
+     這些格子只有「標籤＋數字」兩行、本來就窄，塌成一欄不會更好讀，
+     只是把頁面拉長一倍。項目數為奇數時最後一格橫跨整列，收邊才整齊 */
+  .kpi-grid,.quick-insight,.monthly-summary-grid{grid-template-columns:1fr 1fr;}
+  .kpi-grid > *:nth-child(odd):last-child,
+  .quick-insight > *:nth-child(odd):last-child,
+  .monthly-summary-grid > *:nth-child(odd):last-child{grid-column:1 / -1;}
+  .kpi-grid{margin-top:16px;}
+  .analytics-grid,.monthly-grid{margin-top:12px;}
 }
 `;
 
