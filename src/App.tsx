@@ -7565,14 +7565,21 @@ button,input,select{font:inherit;}
   .btn{min-height:40px;}
   /* 同上：手機上實際會被點選的輸入框都拉到 16px，避免 iOS 自動放大 */
   .mobile-add-form select,.mobile-add-form input,.aw-search-box input,.fx-box input{font-size:16px;}
-  /* 小型統計格在手機維持 2 欄（必須寫在上面那條 1fr 之後才會生效）：
-     這些格子只有「標籤＋數字」兩行、本來就窄，塌成一欄不會更好讀，
-     只是把頁面拉長一倍。項目數為奇數時最後一格橫跨整列，收邊才整齊 */
-  .kpi-grid,.quick-insight,.monthly-summary-grid{grid-template-columns:1fr 1fr;}
-  .kpi-grid > *:nth-child(odd):last-child,
+  /* 2 欄只給「標籤＋短數字」的小格子（必須寫在上面那條 1fr 之後才會生效）：
+     這類格子本來就窄，塌成一欄不會更好讀，只是把頁面拉長一倍。
+     項目數為奇數時最後一格橫跨整列，收邊才整齊 */
+  .quick-insight,.monthly-summary-grid{grid-template-columns:1fr 1fr;}
   .quick-insight > *:nth-child(odd):last-child,
   .monthly-summary-grid > *:nth-child(odd):last-child{grid-column:1 / -1;}
-  .kpi-grid{margin-top:16px;}
+  .quick-card{padding:12px 14px;}
+  .quick-label{margin-bottom:6px;}
+  /* kpi-grid 反例：那四張卡每張都帶一整句說明（例如「…可動用現金｜
+     約可支撐 12.3 個月支出」），半個螢幕寬會把它斷成三四行、四張卡
+     高度各不相同，排起來反而更亂。維持一欄，改用壓縮內距與行距省高度 */
+  .kpi-grid{grid-template-columns:1fr;margin-top:16px;gap:10px;}
+  .aw-kpi-label{margin-bottom:10px;}
+  .aw-kpi-value{line-height:1.05;}
+  .aw-kpi-sub{margin-top:8px;line-height:1.55;}
   .analytics-grid,.monthly-grid{margin-top:12px;}
 }
 `;
