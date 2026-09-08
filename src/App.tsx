@@ -6760,12 +6760,14 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .data-table tbody tr:nth-child(even) td{background:${T.surfaceInset}}
 .data-table tbody tr:nth-child(even):hover td{background:${T.surfaceHover}}
 
-.rec-mobile-list{display:none;flex-direction:column;gap:10px}
-.rec-mobile-card{background:${T.surfaceAlt};border:1px solid ${T.border};border-radius:12px;padding:14px}
-.rec-mobile-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.rec-mobile-list{display:none;flex-direction:column;gap:8px}
+.rec-mobile-card{background:${T.surfaceAlt};border:1px solid ${T.border};border-radius:12px;padding:12px}
+.rec-mobile-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .rec-mobile-month{font-weight:700;font-size:15px;color:${T.text}}
-.rec-mobile-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
-.rec-mobile-field{display:flex;flex-direction:column;gap:2px}
+.rec-mobile-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px 14px}
+/* 標籤與數值改左右並排（原本上下堆疊）：每格從兩行變一行，六個欄位
+   就省下約三行高度。一格約 160px 寬，放得下「標籤＋九位數字」 */
+.rec-mobile-field{display:flex;flex-direction:row;align-items:baseline;justify-content:space-between;gap:8px}
 .rec-mobile-label{font-size:10px;color:${T.textTertiary};font-weight:700;letter-spacing:0.05em;text-transform:uppercase}
 .rec-mobile-value{font-size:13px;font-weight:600;color:${T.text}}
 .rec-mobile-note{margin-top:10px;font-size:12px;color:${T.textTertiary};line-height:1.5}
@@ -7465,13 +7467,21 @@ button,input,select{font:inherit;}
 .add-form-content{overflow:hidden;max-height:0;opacity:0;transition:max-height 0.3s ease,opacity 0.3s ease,margin 0.3s ease;margin-top:0;}
 .add-form-content.open{max-height:200px;opacity:1;margin-top:12px;}
 
-.mobile-asset-card{display:none;border-radius:var(--radius-md);background:var(--c-surface-2);border:1px solid var(--c-border);padding:16px;margin-bottom:8px;}
-.mobile-asset-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
-.mobile-asset-card-name{font-size:15px;font-weight:800;color:var(--c-text);display:flex;align-items:center;gap:8px;}
-.mobile-asset-card-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
-.mobile-asset-card-field{display:flex;flex-direction:column;gap:3px;}
-.mobile-asset-card-field-label{font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--c-text-3);font-weight:700;}
-.mobile-asset-card-field-value{font-size:13px;font-weight:700;color:var(--c-text);font-family:var(--mono);}
+/* 手機資產卡：只在 ≤768px 渲染（桌機用表格，這張卡 display:none），
+   所以可以獨立設計而完全不影響電腦版。
+   舊版是「標頭 ＋ 2×2 四格」約 146px/檔，19 檔就吃掉四個手機螢幕；
+   改成兩行密排（名稱＋台幣市值／目標·目前＋差距）約 72px/檔。
+   刪除鈕絕對定位、垂直置中：44px 觸控範圍剛好等於兩行文字的高度，
+   不必再為了容納按鈕而把卡片撐高。 */
+.mobile-asset-card{display:none;position:relative;border-radius:var(--radius-md);background:var(--c-surface-2);border:1px solid var(--c-border);padding:10px 52px 10px 12px;margin-bottom:6px;}
+.mac-line1{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.mac-name{display:flex;align-items:center;gap:6px;min-width:0;font-size:14px;font-weight:800;color:var(--c-text);}
+.mac-name-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mac-value{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--c-text);white-space:nowrap;}
+.mac-line2{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:4px;font-size:11px;font-weight:600;color:var(--c-text-3);}
+.mac-meta{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;}
+.mac-orig{font-family:var(--mono);color:var(--c-text-2);}
+.mobile-asset-card .delete-btn{position:absolute;right:6px;top:50%;transform:translateY(-50%);}
 
 .settings-title{display:flex;align-items:center;gap:8px;font-size:18px;font-weight:800;color:var(--c-text);margin-bottom:20px;}
 .form-group+.form-group{margin-top:18px;}
@@ -7581,6 +7591,11 @@ button,input,select{font:inherit;}
   .aw-kpi-value{line-height:1.05;}
   .aw-kpi-sub{margin-top:8px;line-height:1.55;}
   .analytics-grid,.monthly-grid{margin-top:12px;}
+  /* 分類標頭與「新增資產」列的內距縮一號：每個分類省約 14px，
+     六個分類就是接近一個螢幕的十分之一 */
+  .category-header{padding:12px 14px;}
+  .category-footer{padding-top:8px;}
+  .add-btn-inline{padding:8px 12px;}
 }
 `;
 
@@ -11365,85 +11380,58 @@ function AssetWarroomTab({ isDark, privacy, active, fireExpense }) {
                                   className="mobile-asset-card"
                                   key={`m-${item.id}`}
                                 >
-                                  <div className="mobile-asset-card-head">
-                                    <div className="mobile-asset-card-name">
+                                  <div className="mac-line1">
+                                    <div className="mac-name">
                                       <CategoryIcon category={cat} />
-                                      {item.name}
-                                      <span className="tag">
-                                        {inputCurrency}
+                                      <span className="mac-name-text">
+                                        {item.name}
                                       </span>
-                                    </div>
-                                    <button
-                                      className="delete-btn"
-                                      aria-label={`刪除 ${item.name || "資產"}`}
-                                      onClick={() =>
-                                        handleDeleteRequest(item.id)
-                                      }
-                                    >
-                                      <Trash2 size={13} />
-                                    </button>
-                                  </div>
-                                  <div className="mobile-asset-card-grid">
-                                    <div className="mobile-asset-card-field">
-                                      <div className="mobile-asset-card-field-label">
-                                        輸入市值
-                                      </div>
-                                      <div className="mobile-asset-card-field-value">
-                                        {maskMoney(
-                                          inputCurrency === "USD"
-                                            ? formatUsd(item.value)
-                                            : formatCurrency(item.value)
-                                        )}
-                                      </div>
-                                    </div>
-                                    <div className="mobile-asset-card-field">
-                                      <div className="mobile-asset-card-field-label">
-                                        換算台幣
-                                      </div>
-                                      <div className="mobile-asset-card-field-value">
-                                        {maskMoney(formatCurrency(twdValue))}
-                                      </div>
-                                    </div>
-                                    <div className="mobile-asset-card-field">
-                                      <div className="mobile-asset-card-field-label">
-                                        {isEmergencyCat
-                                          ? "占總資產"
-                                          : "目標 / 目前"}
-                                      </div>
-                                      <div
-                                        className="mobile-asset-card-field-value"
-                                        style={{ color: "var(--c-accent)" }}
-                                      >
-                                        {isEmergencyCat
-                                          ? `${currentPct}%`
-                                          : `${item.targetPercent}% / ${currentPct}%`}
-                                      </div>
-                                    </div>
-                                    <div className="mobile-asset-card-field">
-                                      <div className="mobile-asset-card-field-label">
-                                        差距
-                                      </div>
-                                      {isEmergencyCat ? (
-                                        <div className="mobile-asset-card-field-value">
-                                          —
-                                        </div>
-                                      ) : (
-                                        <div
-                                          className={`diff-chip ${
-                                            isActionOver ? "over" : "under"
-                                          }`}
-                                          style={{
-                                            fontSize: 11,
-                                            padding: "3px 8px",
-                                            width: "fit-content",
-                                          }}
-                                        >
-                                          {isActionOver ? "+" : ""}
-                                          {maskMoney(formatCompactFixed(diff))}
-                                        </div>
+                                      {inputCurrency === "USD" && (
+                                        <span className="tag">USD</span>
                                       )}
                                     </div>
+                                    <div className="mac-value">
+                                      {maskMoney(formatCurrency(twdValue))}
+                                    </div>
                                   </div>
+                                  <div className="mac-line2">
+                                    <div className="mac-meta">
+                                      {/* 台幣資產的「輸入市值」與「換算台幣」是同一個
+                                          數字，只有外幣才需要再顯示一次原幣別金額 */}
+                                      {inputCurrency === "USD" && (
+                                        <span className="mac-orig">
+                                          {maskMoney(formatUsd(item.value))}
+                                        </span>
+                                      )}
+                                      <span>
+                                        {isEmergencyCat
+                                          ? `占總資產 ${currentPct}%`
+                                          : `目標 ${item.targetPercent}% · 目前 ${currentPct}%`}
+                                      </span>
+                                    </div>
+                                    {!isEmergencyCat && (
+                                      <div
+                                        className={`diff-chip ${
+                                          isActionOver ? "over" : "under"
+                                        }`}
+                                        style={{
+                                          fontSize: 10,
+                                          padding: "2px 7px",
+                                          flexShrink: 0,
+                                        }}
+                                      >
+                                        {isActionOver ? "+" : ""}
+                                        {maskMoney(formatCompactFixed(diff))}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <button
+                                    className="delete-btn"
+                                    aria-label={`刪除 ${item.name || "資產"}`}
+                                    onClick={() => handleDeleteRequest(item.id)}
+                                  >
+                                    <Trash2 size={13} />
+                                  </button>
                                 </div>
                               );
                             })}
