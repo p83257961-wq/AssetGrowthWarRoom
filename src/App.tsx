@@ -7593,9 +7593,10 @@ button,input,select{font:inherit;}
   .analytics-grid,.monthly-grid{margin-top:12px;}
   /* 分類標頭與「新增資產」列的內距縮一號：每個分類省約 14px，
      六個分類就是接近一個螢幕的十分之一 */
-  .category-header{padding:12px 14px;}
-  .category-footer{padding-top:8px;}
-  .add-btn-inline{padding:8px 12px;}
+  .category-header{padding:12px 14px;gap:8px;}
+  /* 每個分類末端的「＋ 新增資產」在手機上是重複的：頂部已有「新增資產」，
+     且手機版開的是可選分類的底部面板，功能完全涵蓋。六個分類省約 270px */
+  .category-footer{display:none;}
 }
 `;
 
@@ -8457,7 +8458,17 @@ function AssetWarroomTab({ isDark, privacy, active, fireExpense }) {
   const [sortMode, setSortMode] = useState("manual");
   const [newAsset, setNewAsset] = useState(INITIAL_NEW_ASSET);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [showAnalytics, setShowAnalytics] = useState(true);
+  // 手機預設收合「進階分析」：那一區的圖表在窄螢幕會佔掉好幾個螢幕高度，
+  // 而手機上的主要任務是查看與更新資產清單，圖表通常在電腦上看。
+  // 標題列點一下即可展開，桌機維持原本的展開狀態不受影響。
+  // 用 window.innerWidth 而非 isMobile：該 hook 在本行之後才宣告
+  const [showAnalytics, setShowAnalytics] = useState(() => {
+    try {
+      return window.innerWidth > 768;
+    } catch {
+      return true;
+    }
+  });
 
   // ── NEW STATE ──
   // Derived: true only while assets exactly match the built-in defaults
