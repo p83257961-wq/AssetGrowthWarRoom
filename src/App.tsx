@@ -4886,13 +4886,33 @@ export default function App() {
                 <div className="rec-mobile-card" key={`m-${row.month}`}>
                   <div className="rec-mobile-head">
                     <span className="mono rec-mobile-month">{row.month}</span>
-                    <span
-                      className={`return-chip ${
-                        row.returnRate >= 0 ? "pos" : "neg"
-                      }`}
-                    >
-                      {fmtP(row.returnRate)}
-                    </span>
+                    {/* 報酬晶片與編輯／刪除併入標頭同一列：原本獨立一列
+                        （含上邊框與間距）每個月多吃 49px，23 個月就是一整個多螢幕 */}
+                    <div className="rec-mobile-head-right">
+                      <span
+                        className={`return-chip ${
+                          row.returnRate >= 0 ? "pos" : "neg"
+                        }`}
+                      >
+                        {fmtP(row.returnRate)}
+                      </span>
+                      <button
+                        className="icon-btn"
+                        onClick={() => handleEdit(row)}
+                        title="編輯"
+                        aria-label={`編輯 ${row.month}`}
+                      >
+                        <Pencil size={13} />
+                      </button>
+                      <button
+                        className="icon-btn"
+                        onClick={() => handleDel(row.month)}
+                        title="刪除"
+                        aria-label={`刪除 ${row.month}`}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
                   </div>
                   <div className="rec-mobile-grid">
                     <div className="rec-mobile-field">
@@ -4949,24 +4969,6 @@ export default function App() {
                   {row.note && row.note !== "歷史資料導入" && (
                     <div className="rec-mobile-note">{row.note}</div>
                   )}
-                  <div className="rec-mobile-actions">
-                    <button
-                      className="icon-btn"
-                      onClick={() => handleEdit(row)}
-                      title="編輯"
-                      aria-label={`編輯 ${row.month}`}
-                    >
-                      <Pencil size={13} />
-                    </button>
-                    <button
-                      className="icon-btn"
-                      onClick={() => handleDel(row.month)}
-                      title="刪除"
-                      aria-label={`刪除 ${row.month}`}
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
                 </div>
               ))}
               {!tableData.length && (
@@ -5772,10 +5774,7 @@ export default function App() {
                 flexWrap: "wrap",
               }}
             >
-              <div
-                className="goal-input-wrap"
-                style={{ flex: "0 1 calc(50% - 12px)", minWidth: 240 }}
-              >
+              <div className="goal-input-wrap fire-expense-wrap">
                 <span className="goal-prefix mono">年支出 NT$</span>
                 <MaskedNumInput
                   privacy={privacy}
@@ -6660,6 +6659,9 @@ table{border-collapse:collapse}
 @media(max-width:768px){.two-col{grid-template-columns:1fr}}
 
 .goal-input-wrap{display:flex;align-items:center;border:1.5px solid ${T.border};border-radius:10px;overflow:hidden;margin:12px 0;transition:border-color 0.2s,box-shadow 0.2s}
+/* FIRE 年支出輸入框：桌機與下方「退休後年收」同寬（fire-grid 左欄 = 50% − 12px）；
+   原本寫成 inline style，手機版無法用 media query 覆寫，改成 class */
+.fire-expense-wrap{flex:0 1 calc(50% - 12px);min-width:240px}
 .goal-input-wrap:focus-within{border-color:${T.gold};box-shadow:0 0 0 3px ${T.goldLight}}
 .goal-prefix{padding:10px 14px;font-size:13px;font-weight:500;color:${T.textTertiary};background:${T.surfaceAlt};border-right:1px solid ${T.border}}
 .goal-input{flex:1;border:none;outline:none;padding:10px 14px;font-size:16px;font-weight:500;color:${T.text};background:transparent}
@@ -6771,7 +6773,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .rec-mobile-label{font-size:10px;color:${T.textTertiary};font-weight:700;letter-spacing:0.05em;text-transform:uppercase}
 .rec-mobile-value{font-size:13px;font-weight:600;color:${T.text}}
 .rec-mobile-note{margin-top:10px;font-size:12px;color:${T.textTertiary};line-height:1.5}
-.rec-mobile-actions{display:flex;gap:6px;justify-content:flex-end;margin-top:10px;padding-top:10px;border-top:1px solid ${T.border}}
+.rec-mobile-head-right{display:flex;align-items:center;gap:6px}
 @media(max-width:768px){
   .table-scroll{display:none}
   .rec-mobile-list{display:flex}
@@ -6895,6 +6897,28 @@ select option{background:${T.surfaceAlt};color:${T.text}}
   .chart-wrap{padding:12px 4px 8px 0}
   .kpi-item{padding:12px}
   .annual-card{padding:16px}
+  /* ── 手機實測（375px）修正 ─────────────────────────────
+     以下每項都是在真實 375px 視窗量到的問題，不是推測 */
+  /* 標頭：雲端晶片 31px 與按鈕 40px 不等高，同一列上下不齊；
+     「新增」被擠到第二列時改為滿版主按鈕，而非孤零零靠左 */
+  .cloud-status{min-height:40px}
+  .header-right .btn-primary{flex:1 1 100%;justify-content:center}
+  /* 分頁列 35px → 40px 觸控高度；10px 微標籤提到 11px。
+     字級提高後五個分頁總寬 365px 超過容器 350px、最右邊的「資產配置」被切掉
+     11px（375px 實測），所以左右內距 10→6、圖示與文字間距 6→3，總寬回到約 310px */
+  .nav-tab{min-height:40px;padding:10px 6px;gap:3px}
+  .nav-tab span,.brand-text,.kpi-label,.rec-mobile-label,.sc-sum-label{font-size:11px}
+  /* 年度績效卡：四行「標籤／數值」改 2×2，每張卡省約 60px */
+  .annual-rows{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+  /* 滑桿：原本整個 input 只有 5px 高（命中區＝軌道），手指幾乎只能點到圓點。
+     把 input 撐到 24px 當命中區、軌道改由偽元素畫在中線，外觀不變 */
+  .range-input{height:24px;background:transparent;margin:0}
+  .range-input::-webkit-slider-runnable-track{height:5px;border-radius:999px;background:${T.borderStrong}}
+  .range-input::-webkit-slider-thumb{margin-top:-8.5px}
+  .range-input::-moz-range-track{height:5px;border-radius:999px;background:${T.borderStrong}}
+  /* FIRE 年支出：手機沒有 50% 那個寬度，min-width 240 會把內容截掉 33px，改滿版 */
+  .fire-expense-wrap{flex:1 1 100%;min-width:0}
+  .rec-mobile-head .icon-btn{width:34px;height:34px}
   /* ── 手機專屬精簡（桌機不受影響）────────────────────────
      手機寬度是稀缺資源：圖示已經說明的狀態就不再重複用文字說一次 */
   /* 隱私狀態看圖示（👁／👁‍🗨）與打碼數字即知，文字標籤省略 */
@@ -7594,6 +7618,16 @@ button,input,select{font:inherit;}
   /* 分類標頭與「新增資產」列的內距縮一號：每個分類省約 14px，
      六個分類就是接近一個螢幕的十分之一 */
   .category-header{padding:12px 14px;gap:8px;}
+  /* ── 手機實測（375px）修正 ── */
+  /* nudge 橫幅：桌機是一列四欄，手機把文字擠成 69px 寬的細長條（整條 256px 高）；
+     改為換行：第一列圖示＋文字，第二列按鈕 */
+  .nudge-banner{flex-wrap:wrap;padding:14px 16px;gap:10px 12px;}
+  .nudge-body{flex:1 1 200px;}
+  .nudge-banner > .btn{flex:1 1 auto;justify-content:center;}
+  .nudge-dismiss{padding:10px;}
+  /* 匯率建議列的兩顆迷你按鈕（11×11 與 21px 高）拉到可點的大小 */
+  button[title="忽略建議"]{min-width:28px!important;min-height:28px!important;padding:6px!important;}
+  .fx-status > button{min-height:32px!important;padding:6px 10px!important;}
   /* 每個分類末端的「＋ 新增資產」在手機上是重複的：頂部已有「新增資產」，
      且手機版開的是可選分類的底部面板，功能完全涵蓋。六個分類省約 270px */
   .category-footer{display:none;}
