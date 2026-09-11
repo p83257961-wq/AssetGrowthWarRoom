@@ -1458,6 +1458,13 @@ export default function App() {
   // Sync module-level T before render
   T = isDark ? THEMES.dark : THEMES.light;
   const css = useMemo(() => makeCSS(T), [isDark]);
+  // 瀏覽器分頁標題：index.html 的 <title> 是建置範本的預設值（顯示 React），
+  // 由 App 自己覆寫才不依賴部署端的 HTML；切到老婆帳本時一併標示，避免記錯本
+  useEffect(() => {
+    document.title = IS_WIFE_BOOK
+      ? `資產成長戰情室｜${BOOK_LABEL}`
+      : "資產成長戰情室";
+  }, []);
   // 字型改為 mount 時注入 <link>：原本 @import 埋在 JS 注入的 <style> 內，
   // 形成「JS 執行 → CSS 注入 → 字型 CSS → 字型檔」三段串行，FOUT 期間更長；
   // 用 preconnect 先建連線、<link rel=stylesheet> 讓瀏覽器並行抓取
