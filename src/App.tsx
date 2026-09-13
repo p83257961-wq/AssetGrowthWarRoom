@@ -3128,9 +3128,10 @@ export default function App() {
           >
             {isDark ? <Sun size={16} /> : <Moon size={16} />}
           </button>
-          <button className="btn-ghost" onClick={() => setShowDataModal(true)}>
+          <button className="btn-ghost data-btn" onClick={() => setShowDataModal(true)}>
             <Download size={14} />
-            資料
+            {/* 文字在手機隱藏，好讓「新增」擠進同一列（見 .data-btn 的手機規則） */}
+            <span className="data-btn-label">資料</span>
           </button>
           <button
             className="btn-primary"
@@ -6906,10 +6907,15 @@ select option{background:${T.surfaceAlt};color:${T.text}}
   .annual-card{padding:16px}
   /* ── 手機實測（375px）修正 ─────────────────────────────
      以下每項都是在真實 375px 視窗量到的問題，不是推測 */
-  /* 標頭：雲端晶片 31px 與按鈕 40px 不等高，同一列上下不齊；
-     「新增」被擠到第二列時改為滿版主按鈕，而非孤零零靠左 */
+  /* 標頭：雲端晶片 31px 與按鈕 40px 不等高，同一列上下不齊 */
   .cloud-status{min-height:40px}
-  .header-right .btn-primary{flex:1 1 100%;justify-content:center}
+  /* 「新增」原本滿版一長條很醜。改法是騰出空間讓它排進第一列、緊接「資料」：
+     隱藏「資料」文字（圖示已足夠）、按鈕左右內距與列間距各收一點。
+     實測 375px：35+93+42+42+42+70 ＋ 5 個 4px 間距 ＝ 344 ≤ 351 */
+  .header-right{gap:4px}
+  .data-btn-label{display:none}
+  .btn-ghost,.btn-primary{padding:8px 10px}
+  .book-btn{padding:8px 10px}
   /* 分頁列 35px → 40px 觸控高度；10px 微標籤提到 11px。
      字級提高後五個分頁總寬 365px 超過容器 350px、最右邊的「資產配置」被切掉
      11px（375px 實測），所以左右內距 10→6、圖示與文字間距 6→3，總寬回到約 310px */
@@ -7632,6 +7638,27 @@ button,input,select{font:inherit;}
   .nudge-body{flex:1 1 200px;}
   .nudge-banner > .btn{flex:1 1 auto;justify-content:center;}
   .nudge-dismiss{padding:10px;}
+  /* 匯入／匯出 CSV 在手機用不到（檔案操作都在電腦上做），隱藏後
+     工具列的四個項目剛好收成一列 */
+  .aw-csv-btn{display:none!important;}
+  /* 搜尋與排序併排：同一張卡內原本上下堆疊，各佔一列 */
+  .filter-row{flex-wrap:nowrap;gap:8px;}
+  .aw-search-box{min-width:0;flex:1 1 60%;}
+  .filter-row > select,.filter-row > .sort-select{flex:1 1 40%;min-width:0;}
+  .filter-card{padding:14px;}
+  /* 資產／匯率／目標占比三個標籤併成一列（搭配上面的短標籤） */
+  .hero-tags{gap:6px;flex-wrap:nowrap;}
+  .hero-tag{font-size:10px;padding:6px 8px;gap:4px;white-space:nowrap;min-width:0;}
+  /* 現金水位＋本月變動、今年以來＋配置偏離度 兩兩併排。
+     卡片變窄後字級同步縮一號，說明文字固定裁到兩行，四張卡高度才會一致 */
+  .kpi-grid{grid-template-columns:1fr 1fr;gap:8px;}
+  .kpi-card{padding:12px;}
+  .aw-kpi-label{font-size:11px;margin-bottom:6px;gap:4px;}
+  .aw-kpi-value{font-size:20px;}
+  .aw-kpi-sub{font-size:10px;line-height:1.45;margin-top:6px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .kpi-badge{font-size:9px;padding:3px 6px;}
+  /* 卡片變窄後，說明泡泡 220px 會超出畫面右緣造成水平捲動 */
+  .inline-tooltip-bubble{width:auto;min-width:180px;max-width:calc(100vw - 56px);}
   /* 匯率建議列的兩顆迷你按鈕（11×11 與 21px 高）拉到可點的大小 */
   button[title="忽略建議"]{min-width:28px!important;min-height:28px!important;padding:6px!important;}
   .fx-status > button{min-height:32px!important;padding:6px 10px!important;}
@@ -9931,14 +9958,14 @@ function AssetWarroomTab({ isDark, privacy, active, fireExpense }) {
           <RotateCcw size={16} />
         </button>
         <button
-          className="btn"
+          className="btn aw-csv-btn"
           onClick={() => awCsvInputRef.current && awCsvInputRef.current.click()}
           title="與匯出相同格式；匯入後完全取代現有資產清單"
         >
           <Upload size={15} />
           匯入 CSV
         </button>
-        <button className="btn primary" onClick={exportCSV}>
+        <button className="btn primary aw-csv-btn" onClick={exportCSV}>
           <Download size={15} />
           匯出 CSV
         </button>
@@ -10120,7 +10147,10 @@ function AssetWarroomTab({ isDark, privacy, active, fireExpense }) {
                         },
                         {
                           icon: <Target size={13} />,
-                          text: `目標總占比 ${totalTargetPercent.toFixed(1)}%`,
+                          // 手機用短標籤，三個標籤才併得進同一列（實測 375px）
+                          text: `${
+                            isMobile ? "目標" : "目標總占比"
+                          } ${totalTargetPercent.toFixed(1)}%`,
                           warn: totalTargetPercent > 100,
                           soft:
                             totalTargetPercent > 0 && totalTargetPercent < 100,
